@@ -17,7 +17,7 @@ type Props = {
  *   - Staff Prep host  → siteConfig.url        (where the .yaml is served)
  *   - Vetora host      → customFields.vetoraUrl (the /preview renderer)
  *
- * Final URL: {vetoraUrl}/preview?url={staffPlusHost}{baseUrl}designs/{file}
+ * Final URL: {vetoraUrl}/preview?url={staffPlusHost}{baseUrl}designs/{file}&tab=true
  */
 export default function DesignPreview({
   file,
@@ -35,7 +35,7 @@ export default function DesignPreview({
     : `${siteConfig.baseUrl}/`;
 
   const designUrl = `${host}${base}designs/${file}`;
-  const previewUrl = `${vetoraUrl}/preview?url=${encodeURIComponent(designUrl)}`;
+  const previewUrl = `${vetoraUrl}/preview?url=${encodeURIComponent(designUrl)}&tab=true`;
 
   return (
     <div>
