@@ -1,0 +1,60 @@
+:root {
+  --ifm-color-primary: #3b82f6;
+  --ifm-color-primary-dark: #2563eb;
+  --ifm-color-primary-darker: #1d4ed8;
+  --ifm-color-primary-darkest: #1e40af;
+  --ifm-color-primary-light: #60a5fa;
+  --ifm-color-primary-lighter: #93bbfd;
+  --ifm-color-primary-lightest: #bfdbfe;
+  --ifm-code-font-size: 90%;
+  --ifm-font-family-base: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #60a5fa;
+  --ifm-color-primary-dark: #3b82f6;
+  --ifm-color-primary-darker: #2563eb;
+  --ifm-color-primary-darkest: #1d4ed8;
+  --ifm-color-primary-light: #93bbfd;
+  --ifm-color-primary-lighter: #bfdbfe;
+  --ifm-color-primary-lightest: #dbeafe;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* Use full width for doc content */
+.docMainContainer_node_modules-\@docusaurus-theme-classic-lib-theme-DocPage-Layout-Main-styles-module {
+  max-width: 100%;
+}
+
+[class*='docItemContainer'] {
+  max-width: 100%;
+}
+
+article {
+  max-width: 100%;
+}
+
+.container {
+  max-width: 1400px;
+}
+
+/* Admonition styling for trade-off boxes */
+.admonition-tradeoff {
+  border-left-color: #f59e0b;
+}
+
+/* Better table styling */
+table {
+  display: table;
+  width: 100%;
+}
+
+table th {
+  text-align: left;
+}
+
+/* Mermaid diagram sizing */
+.mermaid {
+  text-align: center;
+}

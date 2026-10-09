@@ -1,0 +1,11 @@
+{
+  "designs": [
+    {
+      "id": "chat-system",
+      "title": "Chat System (WhatsApp / Slack)",
+      "problem": "/problems/messaging/chat-system",
+      "format": "vetora-yaml",
+      "file": "/designs/chat-system.vetora.yaml"
+    }
+  ]
+}

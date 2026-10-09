@@ -1,0 +1,20 @@
+- Multi-threading
+- Leadership Board using Redis (skip list)
+- Hashing internals
+- Encryption internals
+- Isolation levels
+- bloom filter
+- consistent hashing
+- distirbuted transaction
+- LRU Cache with TTL, locking for multi-threaded app,
+- CI/CD  highlevel idea and tools
+- K8s, Docker, Pods etc
+- Signal Protocol for key exchange
+- gRPC
+- WebRTC
+- OAuth2.0
+- JWT
+- WebSockets
+-
+
+

@@ -1,0 +1,645 @@
+system_name: "Chat System (WhatsApp / Slack)"
+description: >
+  Real-time E2E-encrypted messaging. WebSocket hot path for delivery, REST cold
+  path for chat/participant management and inbox sync. Messaging Service persists
+  ciphertext to Cassandra, pushes real-time via the WebSocket layer, and publishes
+  to Kafka for durable write-time fan-out. A Fan-out Worker writes per-user inbox
+  entries to Redis and emits notification events consumed by a Notification Worker.
+entry_points:
+  - client
+
+components:
+  # ---------------- Edge / entry ----------------
+  client:
+    type: Client
+    position: { x: 40, y: 520 }
+
+  api_gateway:
+    type: ApiGateway
+    position: { x: 400, y: 220 }
+    auth_enabled: true
+    auth_latency_ms: 8
+    auth_failure_rate: 0.005
+    max_concurrent_requests: 50000
+    rate_limit_rps: 50000
+
+  ws_lb:
+    type: LoadBalancer
+    position: { x: 400, y: 820 }
+    max_rps: 200000
+    algorithm: least_connections
+    latency_ms: 1
+    max_connections: 200000
+
+  # ---------------- Real-time layer ----------------
+  connection_ws:
+    type: WebSocketService
+    position: { x: 760, y: 820 }
+    pods: 200
+    max_connections_per_pod: 750000
+    message_latency_ms: 1
+    fanout_latency_ms: 2
+
+  # ---------------- Application services ----------------
+  chat_service:
+    type: Service
+    position: { x: 1120, y: 40 }
+    pods: 10
+    threads_per_pod: 100
+    cpu_cores: 2
+    processing_time_ms: 5
+    total_response_time_ms: 20
+    queue_limit: 2000
+    endpoints:
+      - id: ep_create_chat
+        method: POST
+        path: /api/v1/chats
+        summary: "Create a chat"
+        description: "Creates a 1:1 or group chat and its participant rows."
+        requestBody:
+          - { name: name, field_type: string, required: false, description: "Group name (optional for 1:1)" }
+          - { name: participantIds, field_type: string, required: true, description: "Comma-separated user ids" }
+          - { name: createdBy, field_type: string, required: true, description: "Creator user id" }
+      - id: ep_update_participants
+        method: PUT
+        path: /api/v1/chats/{chatId}/participants
+        summary: "Add/remove participants"
+        description: "Mutates chat membership and notifies affected users."
+        requestBody:
+          - { name: chatId, field_type: string, required: true, description: "Target chat id" }
+          - { name: add, field_type: string, required: false, description: "User ids to add" }
+          - { name: remove, field_type: string, required: false, description: "User ids to remove" }
+      - id: ep_get_participants
+        method: GET
+        path: /api/v1/chats/{chatId}/participants
+        summary: "List chat members"
+        description: "Returns members for fan-out and membership checks. Cache-backed."
+        requestBody:
+          - { name: chatId, field_type: string, required: true, description: "Target chat id" }
+
+  user_service:
+    type: Service
+    position: { x: 1120, y: 280 }
+    pods: 10
+    threads_per_pod: 100
+    cpu_cores: 2
+    processing_time_ms: 4
+    total_response_time_ms: 15
+    queue_limit: 2000
+    endpoints:
+      - id: ep_get_presence
+        method: GET
+        path: /api/v1/users/{userId}/presence
+        summary: "Get presence / last seen"
+        description: "Reads online status from Redis, falls back to last_seen in Postgres."
+        requestBody:
+          - { name: userId, field_type: string, required: true, description: "User id to resolve" }
+      - id: ep_register_connection
+        method: POST
+        path: /api/v1/connections
+        summary: "Register a live connection"
+        description: "Records userId -> (serverId, connId) in the connection registry on WS connect."
+        requestBody:
+          - { name: userId, field_type: string, required: true, description: "Connecting user id" }
+          - { name: clientId, field_type: string, required: true, description: "Device id" }
+          - { name: serverId, field_type: string, required: true, description: "WebSocket pod id" }
+      - id: ep_get_device_tokens
+        method: GET
+        path: /api/v1/users/{userId}/devices
+        summary: "Get push device tokens"
+        description: "Returns APNs/FCM tokens per device for push notifications."
+        requestBody:
+          - { name: userId, field_type: string, required: true, description: "User id to resolve" }
+
+  message_service:
+    type: Service
+    position: { x: 1120, y: 520 }
+    pods: 40
+    threads_per_pod: 100
+    cpu_cores: 4
+    processing_time_ms: 4
+    total_response_time_ms: 30
+    queue_limit: 4000
+    endpoints:
+      - id: ep_send_message
+        method: POST
+        path: /api/v1/messages
+        summary: "Send a message"
+        description: "Persists ciphertext, updates status, publishes fan-out, pushes real-time."
+        requestBody:
+          - { name: chatId, field_type: string, required: true, description: "Target chat id" }
+          - { name: content, field_type: string, required: true, description: "E2E-encrypted ciphertext" }
+          - { name: mediaUrl, field_type: string, required: false, description: "Encrypted media object key" }
+          - { name: mediaType, field_type: string, required: false, description: "MIME type" }
+
+  inbox_service:
+    type: Service
+    position: { x: 1120, y: 760 }
+    pods: 20
+    threads_per_pod: 100
+    cpu_cores: 2
+    processing_time_ms: 2
+    total_response_time_ms: 8
+    queue_limit: 3000
+    endpoints:
+      - id: ep_get_inbox
+        method: GET
+        path: /api/v1/inbox
+        summary: "Fetch undelivered messages"
+        description: "Paginated read of the per-user Redis inbox on reconnect."
+        requestBody:
+          - { name: userId, field_type: string, required: true, description: "Owner user id" }
+          - { name: cursor, field_type: string, required: false, description: "Pagination cursor" }
+          - { name: limit, field_type: number, required: false, description: "Page size" }
+
+  media_service:
+    type: Service
+    position: { x: 1120, y: 1000 }
+    pods: 6
+    threads_per_pod: 50
+    cpu_cores: 2
+    processing_time_ms: 5
+    total_response_time_ms: 20
+    queue_limit: 1000
+    endpoints:
+      - id: ep_request_upload
+        method: POST
+        path: /api/v1/media/upload-url
+        summary: "Request a pre-signed upload URL"
+        description: "Returns an S3 pre-signed URL; client uploads encrypted media directly."
+        requestBody:
+          - { name: chatId, field_type: string, required: true, description: "Target chat id" }
+          - { name: fileType, field_type: string, required: true, description: "MIME type" }
+          - { name: size, field_type: number, required: true, description: "Payload size in bytes" }
+
+  # ---------------- Data stores ----------------
+  postgres:
+    type: Database
+    position: { x: 1560, y: 40 }
+    max_connections: 300
+    read_latency_ms: 4
+    write_latency_ms: 10
+    replicas: 2
+    queue_limit: 5000
+    read_latency_slo_ms: 30
+    write_latency_slo_ms: 100
+    tables:
+      - id: tbl_users
+        name: users
+        primaryKey: id
+        columns:
+          - { name: id, field_type: string, required: true, description: "User id (PK)" }
+          - { name: phone, field_type: string, required: true, description: "E.164 phone" }
+          - { name: name, field_type: string, required: false, description: "Display name" }
+          - { name: last_seen, field_type: number, required: false, description: "Last-seen epoch ms" }
+      - id: tbl_chats
+        name: chats
+        primaryKey: id
+        columns:
+          - { name: id, field_type: string, required: true, description: "Chat id (PK)" }
+          - { name: name, field_type: string, required: false, description: "Group name" }
+          - { name: created_by, field_type: string, required: true, description: "Creator user id" }
+      - id: tbl_chat_participants
+        name: chat_participants
+        primaryKey: chat_id
+        columns:
+          - { name: chat_id, field_type: string, required: true, description: "Chat id (PK part)" }
+          - { name: user_id, field_type: string, required: true, description: "Member user id" }
+
+  redis:
+    type: Cache
+    position: { x: 1560, y: 280 }
+    cache_size_mb: 64000
+    working_set_mb: 80000
+    access_pattern: zipfian
+    latency_hit_ms: 1
+    read_latency_slo_ms: 5
+    write_latency_slo_ms: 10
+    cacheSpaces:
+      - id: cs_connection_registry
+        name: "Connection Registry"
+        keyPattern: "conn:{userId}"
+        defaultTtlSeconds: 60
+        valueFields:
+          - { name: serverId, field_type: string, required: true, description: "WebSocket pod id" }
+          - { name: connId, field_type: string, required: true, description: "Connection id" }
+      - id: cs_inbox
+        name: "User Inbox"
+        keyPattern: "inbox:{userId}"
+        defaultTtlSeconds: 0
+        valueFields:
+          - { name: messageId, field_type: string, required: true, description: "Message id" }
+          - { name: chatId, field_type: string, required: true, description: "Chat id" }
+          - { name: timestamp, field_type: number, required: true, description: "Sort score (epoch ms)" }
+      - id: cs_presence
+        name: "Presence"
+        keyPattern: "presence:{userId}"
+        defaultTtlSeconds: 60
+        valueFields:
+          - { name: lastSeen, field_type: number, required: true, description: "Heartbeat epoch ms" }
+      - id: cs_message_status
+        name: "Message Status"
+        keyPattern: "status:{messageId}"
+        defaultTtlSeconds: 0
+        valueFields:
+          - { name: userId, field_type: string, required: true, description: "Recipient user id" }
+          - { name: status, field_type: string, required: true, description: "SENT|DELIVERED|READ" }
+      - id: cs_chat_participants
+        name: "Chat Participants Cache"
+        keyPattern: "chat:{chatId}:members"
+        defaultTtlSeconds: 300
+        valueFields:
+          - { name: userId, field_type: string, required: true, description: "Member user id" }
+
+  cassandra:
+    type: Database
+    position: { x: 1560, y: 520 }
+    max_connections: 500
+    read_latency_ms: 6
+    write_latency_ms: 8
+    replicas: 3
+    queue_limit: 10000
+    read_latency_slo_ms: 30
+    write_latency_slo_ms: 100
+    tables:
+      - id: tbl_messages
+        name: messages
+        primaryKey: chat_id
+        columns:
+          - { name: chat_id, field_type: string, required: true, description: "Partition key" }
+          - { name: timestamp, field_type: number, required: true, description: "Clustering key (DESC)" }
+          - { name: message_id, field_type: string, required: true, description: "Message id" }
+          - { name: sender_id, field_type: string, required: true, description: "Sender user id" }
+          - { name: content, field_type: string, required: true, description: "E2E ciphertext blob" }
+          - { name: media_url, field_type: string, required: false, description: "Encrypted media key" }
+
+  kafka:
+    type: EventStream
+    position: { x: 1560, y: 760 }
+    throughput_limit_per_sec: 0
+    publish_latency_ms: 3
+    queue_limit: 2000000
+    partitions: 200
+    topics:
+      - id: topic_message_fanout
+        name: "message-fanout"
+        partitionKey: chatId
+        schema:
+          - { name: messageId, field_type: string, required: true, description: "Message id" }
+          - { name: chatId, field_type: string, required: true, description: "Chat id (partition key)" }
+          - { name: senderId, field_type: string, required: true, description: "Sender user id" }
+      - id: topic_notifications
+        name: "notifications"
+        partitionKey: userId
+        schema:
+          - { name: userId, field_type: string, required: true, description: "Recipient user id (partition key)" }
+          - { name: chatId, field_type: string, required: true, description: "Chat id" }
+          - { name: senderName, field_type: string, required: false, description: "Sender display name" }
+
+  s3:
+    type: ObjectStorage
+    position: { x: 1560, y: 1000 }
+    base_latency_ms: 8
+    size_latency_factor_ms_per_mb: 4
+    max_concurrent_requests: 20000
+    presigned_url_enabled: true
+
+  # ---------------- Async consumers ----------------
+  fanout_worker:
+    type: Worker
+    position: { x: 1960, y: 640 }
+    workers: 50
+    processing_time_ms: 5
+    cpu_cores: 2
+    queue_limit: 50000
+
+  notification_worker:
+    type: Worker
+    position: { x: 1960, y: 880 }
+    workers: 20
+    processing_time_ms: 8
+    cpu_cores: 2
+    queue_limit: 20000
+
+edges:
+  # ===== Entry =====
+  - source: client
+    target: api_gateway
+    edge_type: API_CALL
+    label: "REST (cold path)"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 15
+
+  - source: client
+    target: ws_lb
+    edge_type: API_CALL
+    label: "WebSocket connect"
+    source_handle: source-bottom-1
+    target_handle: target-left-1
+    latency_ms: 15
+
+  - source: ws_lb
+    target: connection_ws
+    edge_type: API_CALL
+    label: "Route connection"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  # ===== API Gateway routing =====
+  - source: api_gateway
+    target: chat_service
+    edge_type: API_CALL
+    contract_id: ep_create_chat
+    label: "Create / manage chat"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: api_gateway
+    target: user_service
+    edge_type: API_CALL
+    contract_id: ep_get_presence
+    label: "Presence lookup"
+    source_handle: source-right-2
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: api_gateway
+    target: inbox_service
+    edge_type: API_CALL
+    contract_id: ep_get_inbox
+    label: "Inbox sync"
+    source_handle: source-bottom-2
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: api_gateway
+    target: media_service
+    edge_type: API_CALL
+    contract_id: ep_request_upload
+    label: "Request upload URL"
+    source_handle: source-bottom-3
+    target_handle: target-left-1
+    latency_ms: 3
+
+  # ===== WebSocket hot path =====
+  - source: connection_ws
+    target: message_service
+    edge_type: API_CALL
+    contract_id: ep_send_message
+    label: "Deliver SEND_MESSAGE"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: connection_ws
+    target: user_service
+    edge_type: API_CALL
+    contract_id: ep_register_connection
+    label: "Register connection"
+    source_handle: source-top-1
+    target_handle: target-left-2
+    latency_ms: 3
+
+  # ===== Messaging Service downstream =====
+  - source: message_service
+    target: chat_service
+    edge_type: API_CALL
+    contract_id: ep_get_participants
+    label: "Membership check"
+    source_handle: source-top-1
+    target_handle: target-left-2
+    latency_ms: 3
+
+  - source: message_service
+    target: connection_ws
+    edge_type: API_CALL
+    label: "Real-time push"
+    source_handle: source-left-1
+    target_handle: target-top-1
+    latency_ms: 3
+
+  - source: message_service
+    target: cassandra
+    edge_type: DB_CALL
+    contract_id: tbl_messages
+    operation: INSERT
+    label: "Persist message"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_msg_persist
+        source_contract_id: ep_send_message
+        label: "POST /api/v1/messages"
+        field_mappings: []
+
+  - source: message_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_connection_registry
+    operation: GET
+    label: "Lookup online users"
+    source_handle: source-right-2
+    target_handle: target-left-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_msg_registry
+        source_contract_id: ep_send_message
+        label: "Resolve recipient servers"
+        field_mappings: []
+
+  - source: message_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_message_status
+    operation: SET
+    label: "Update status"
+    source_handle: source-top-2
+    target_handle: target-left-2
+    latency_ms: 2
+    input_bindings:
+      - id: ib_msg_status
+        source_contract_id: ep_send_message
+        label: "Mark SENT/DELIVERED"
+        field_mappings: []
+
+  - source: message_service
+    target: kafka
+    edge_type: KAFKA_EVENT
+    contract_id: topic_message_fanout
+    label: "Publish fan-out"
+    source_handle: source-bottom-1
+    target_handle: target-left-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_msg_fanout
+        source_contract_id: ep_send_message
+        label: "Emit message-fanout"
+        field_mappings: []
+
+  # ===== Chat Service downstream =====
+  - source: chat_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_chats
+    operation: INSERT
+    label: "Persist chat"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_chat_insert
+        source_contract_id: ep_create_chat
+        label: "POST /api/v1/chats"
+        field_mappings: []
+
+  - source: chat_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_chat_participants
+    operation: SELECT
+    label: "Read members"
+    source_handle: source-right-2
+    target_handle: target-left-2
+    latency_ms: 3
+    input_bindings:
+      - id: ib_chat_members
+        source_contract_id: ep_get_participants
+        label: "GET participants"
+        field_mappings: []
+
+  - source: chat_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_chat_participants
+    operation: GET
+    label: "Members cache"
+    source_handle: source-bottom-1
+    target_handle: target-top-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_chat_cache
+        source_contract_id: ep_get_participants
+        label: "Hot membership read"
+        field_mappings: []
+
+  # ===== User Service downstream =====
+  - source: user_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_users
+    operation: SELECT
+    label: "Read user/devices"
+    source_handle: source-top-1
+    target_handle: target-left-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_user_read
+        source_contract_id: ep_get_device_tokens
+        label: "GET devices"
+        field_mappings: []
+
+  - source: user_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_presence
+    operation: SET
+    label: "Write presence"
+    source_handle: source-right-1
+    target_handle: target-top-2
+    latency_ms: 2
+    input_bindings:
+      - id: ib_user_presence
+        source_contract_id: ep_get_presence
+        label: "Heartbeat TTL set"
+        field_mappings: []
+
+  - source: user_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_connection_registry
+    operation: SET
+    label: "Write registry"
+    source_handle: source-right-2
+    target_handle: target-top-3
+    latency_ms: 2
+    input_bindings:
+      - id: ib_user_registry
+        source_contract_id: ep_register_connection
+        label: "Register userId->server"
+        field_mappings: []
+
+  # ===== Inbox Service downstream =====
+  - source: inbox_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_inbox
+    operation: GET
+    label: "Read inbox"
+    source_handle: source-top-1
+    target_handle: target-bottom-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_inbox_read
+        source_contract_id: ep_get_inbox
+        label: "GET /api/v1/inbox"
+        field_mappings: []
+
+  # ===== Media Service downstream =====
+  - source: media_service
+    target: s3
+    edge_type: API_CALL
+    label: "Sign / verify object"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 5
+
+  # ===== Async fan-out =====
+  - source: kafka
+    target: fanout_worker
+    edge_type: KAFKA_EVENT
+    contract_id: topic_message_fanout
+    label: "Consume fan-out"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 5
+
+  - source: fanout_worker
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_inbox
+    operation: SET
+    label: "Write inbox entries"
+    source_handle: source-top-1
+    target_handle: target-right-1
+    latency_ms: 2
+
+  - source: fanout_worker
+    target: kafka
+    edge_type: KAFKA_EVENT
+    contract_id: topic_notifications
+    label: "Emit notifications"
+    source_handle: source-left-1
+    target_handle: target-right-1
+    latency_ms: 3
+
+  - source: kafka
+    target: notification_worker
+    edge_type: KAFKA_EVENT
+    contract_id: topic_notifications
+    label: "Consume notifications"
+    source_handle: source-right-2
+    target_handle: target-left-1
+    latency_ms: 5
+
+  - source: notification_worker
+    target: user_service
+    edge_type: API_CALL
+    contract_id: ep_get_device_tokens
+    label: "Lookup device tokens"
+    source_handle: source-top-1
+    target_handle: target-top-1
+    latency_ms: 3
