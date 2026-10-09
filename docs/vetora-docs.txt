@@ -1,0 +1,457 @@
+# Vetora Design YAML — Format Specification
+
+> Audience: AI agents and tools generating a system-architecture design
+> that a user can import into Vetora via **My Designs → Import**.
+> Output a single `.yaml` file following this spec.
+
+Human version: http://localhost:3000/docs/design-format
+
+## 1. How import works
+
+- The user saves your output as a `.yaml` (or `.yml`) file and imports it
+  via **My Designs → Import**. No API call is required.
+- The file is parsed, then converted to a canvas design. It must contain
+  two top-level keys:
+  - `components` — a **map** of `id → component` (required).
+  - `edges` — an **array** of connections (required).
+- Recommended optional keys: `system_name` (import name), `entry_points`
+  (array of client ids, improves auto-layout), `description`.
+- Unknown top-level keys are ignored on import, so extra documentation keys
+  are harmless.
+
+## 2. Components
+
+There are 14 component types (13 simulated + Client, which is UI-only).
+Each entry under `components:` is keyed by a unique id and must set `type:`.
+Always set `position: { x, y }` (grid: columns 360px apart, rows 180px apart;
+nodes are 180px wide) so the imported canvas is readable.
+
+### Client — `type: Client` (UI-only)
+
+UI-only traffic source. Its outgoing edges define the system entry points. Stripped from the topology before simulation — it has no backend handler and takes no simulation params.
+
+### CDN — `type: CDN`
+
+Edge cache that offloads a fraction of requests before they reach the origin.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `offload_ratio` | float | 0.0 | ratio 0-1 | no | Fraction served from edge cache (0 = none, 1 = all). |
+| `latency_ms` | float | 5.0 | ms | no | Per-request processing overhead at the edge. |
+| `max_rps` | float | 500000 | req/s | no | Throughput ceiling before edge rate-limiting. |
+
+### API Gateway — `type: ApiGateway`
+
+Routes requests by path/method to backends, with optional auth, transformation, and rate limiting.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `auth_enabled` | bool | false | — | no | Perform JWT/auth verification per request. |
+| `auth_latency_ms` | float | 10.0 | ms | no | Mean auth-check latency when auth is on. |
+| `auth_failure_rate` | float | 0.0 | ratio 0-1 | no | Fraction of requests rejected at auth. Keep ≤ 0.008 to stay under the 1% error threshold. |
+| `rate_limit_rps` | float | 10000 | rps | no | Cap when rate_limit_enabled is true. |
+| `max_concurrent_requests` | int | 10000 | count | no | In-flight ceiling; excess is dropped (503). |
+
+### Load Balancer — `type: LoadBalancer`
+
+Distributes traffic across downstream instances by a routing algorithm.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `max_rps` | float | 100000 | req/s | yes | Throughput ceiling; enforced over a 1s window, excess dropped. |
+| `algorithm` | enum | round_robin | — | no | round_robin | random | least_connections | weighted_round_robin. |
+| `latency_ms` | float | 1.0 | ms | no | Routing overhead per request. |
+| `max_connections` | int | 50000 | count | no | Concurrent connection ceiling. |
+
+### Service — `type: Service`
+
+Horizontally scaled application server with a thread pool and request queue. Holds a thread for the full round-trip of downstream calls.
+
+Contracts: `endpoints` (bound by `API_CALL` edges).
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `pods` | int | 1 | count | yes | Replica count. Throughput ≈ pods × cpu_cores / processing_time_ms × 1000. |
+| `threads_per_pod` | int | 100 | count | yes | Concurrent in-flight requests per pod. Raises queueing, NOT throughput. |
+| `processing_time_ms` | float | 5.0 | ms | no | Mean CPU work per request. |
+| `total_response_time_ms` | float | — | ms | no | Thread-hold time incl. downstream calls. Set to processing + expected downstream latency for sync services. |
+| `cpu_cores` | int | 2 | count | no | Cores per pod. Bounds real throughput (CPU time-sharing). |
+| `queue_limit` | int | 1000 | count | no | Max queued requests per pod before drops. |
+
+### Cache — `type: Cache`
+
+In-memory cache. Hit ratio is derived from cache_size_mb / working_set_mb under the chosen access pattern.
+
+Contracts: `cacheSpaces` (bound by `CACHE_CALL` edges).
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `cache_size_mb` | float | 8000 | MB | yes | Cache memory. With working_set_mb, drives hit ratio. |
+| `working_set_mb` | float | 10000 | MB | no | Data the app wants cached. hit_ratio ≈ cache_size / working_set. |
+| `access_pattern` | enum | uniform | — | no | uniform | zipfian | hot_set. zipfian/hot_set lift hit ratio. |
+| `latency_hit_ms` | float | 1.0 | ms | no | Hit response time. |
+| `read_latency_slo_ms` | float | 5.0 | ms | no | p99 SLO for GET (overrides generic SLO). |
+| `write_latency_slo_ms` | float | 10.0 | ms | no | p99 SLO for SET. |
+
+### Database — `type: Database`
+
+Relational / NoSQL store with a connection pool and read/write latency split.
+
+Contracts: `tables` (bound by `DB_CALL` edges).
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `max_connections` | int | 100 | count | yes | Pool size across replicas; queries queue when exhausted. |
+| `read_latency_ms` | float | 5.0 | ms | no | Mean SELECT latency. |
+| `write_latency_ms` | float | 10.0 | ms | no | Mean INSERT/UPDATE/DELETE latency. |
+| `replicas` | int | 1 | count | no | Read replicas. Read pool = max_connections × replicas. 1 = single point of failure. |
+| `queue_limit` | int | 5000 | count | no | Max queued queries before drops. |
+| `read_latency_slo_ms` | float | 30.0 | ms | no | p99 SLO for reads (overrides generic). |
+| `write_latency_slo_ms` | float | 100.0 | ms | no | p99 SLO for writes. |
+
+### Object Storage — `type: ObjectStorage`
+
+Blob storage (S3/GCS/Azure Blob) with size-dependent latency and optional presigned-URL direct access.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `base_latency_ms` | float | 5.0 | ms | no | Fixed per-op overhead (TLS, metadata). |
+| `size_latency_factor_ms_per_mb` | float | 5.0 | ms/MB | no | Added latency per MB of payload. |
+| `max_concurrent_requests` | int | 10000 | count | no | In-flight ceiling (S3 503 Slow Down). |
+| `presigned_url_enabled` | bool | false | — | no | Client talks directly to storage; service only signs the URL. |
+
+### Rate Limiter — `type: RateLimiter`
+
+Standalone throughput gate (token bucket / sliding / fixed window / leaky bucket), optionally per-key.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `algorithm` | enum | token_bucket | — | no | token_bucket | sliding_window | fixed_window | leaky_bucket. |
+| `capacity` | int | 100 | count | no | Bucket tokens / per-window count / queue size. |
+| `refill_rate_per_sec` | float | 10.0 | /s | no | Sustained rate after burst (bucket algorithms). |
+| `key_field` | string | "" | — | no | Field for per-key limiting (empty = global). |
+
+### WebSocket Service — `type: WebSocketService`
+
+Long-lived bidirectional connection server with broadcast fanout and heartbeat keepalive.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `pods` | int | 1 | count | no | Server pods; connections hashed across them. |
+| `max_connections_per_pod` | int | 50000 | count | no | Total capacity = pods × this. |
+| `message_latency_ms` | float | 1.0 | ms | no | Per-message processing latency. |
+| `fanout_latency_ms` | float | 2.0 | ms | no | Per-broadcast overhead; total = this + N × per_delivery_latency_ms. |
+
+### GeoDNS / GSLB — `type: GeoDns`
+
+Global load balancer that routes to the closest healthy region, with health-check failover.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `resolution_latency_ms` | float | 1.0 | ms | no | DNS resolution added to every request. |
+| `failover_latency_ms` | float | 30.0 | ms | no | Extra latency when rerouting to another region. |
+
+### Event Stream — `type: EventStream`
+
+Async message platform (Kafka/Kinesis) with partitioned topics and buffering.
+
+Contracts: `topics` (bound by `KAFKA_EVENT` edges).
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `throughput_limit_per_sec` | int | 0 | msg/s | no | Producer rate cap (0 = unlimited). |
+| `publish_latency_ms` | float | 2.0 | ms | no | Produce-to-ack latency. |
+| `queue_limit` | int | 1000000 | count | no | Buffer depth before backpressure drops. |
+| `partitions` | int | 1 | count | no | Topic partitions for parallelism. |
+
+### Worker — `type: Worker`
+
+Pool of async consumers that process messages from an EventStream.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `workers` | int | 1 | count | yes | Parallel worker instances. |
+| `processing_time_ms` | float | 10.0 | ms | no | Mean per-message processing time. |
+| `cpu_cores` | int | 1 | count | no | Cores per worker; total capacity = workers × cpu_cores. |
+| `queue_limit` | int | 10000 | count | no | Max queued messages before drops. |
+
+### Stream Processor — `type: StreamProcessor`
+
+Real-time stream engine (Flink/Spark) that consumes, transforms, and emits downstream.
+
+| Param | Type | Default | Unit | Required | Purpose |
+|---|---|---|---|---|---|
+| `parallelism` | int | 4 | count | no | Parallel task slots. |
+| `processing_time_ms` | float | 5.0 | ms | no | Mean per-event processing time. |
+| `max_throughput` | int | 0 | events/s | no | Rate cap (0 = unlimited). |
+| `buffer_size` | int | 100000 | count | no | Input buffer before upstream backpressure. |
+
+## 3. Connection rules (which components may connect)
+
+Only the pairs below are valid. Any other source→target is rejected by
+validation. The edge must use one of the listed `edge_type` values.
+
+| Source | Target | Allowed edge_type |
+|---|---|---|
+| Client | CDN | API_CALL |
+| Client | GeoDns | API_CALL |
+| Client | ApiGateway | API_CALL |
+| Client | RateLimiter | API_CALL |
+| Client | LoadBalancer | API_CALL |
+| Client | Service | API_CALL |
+| CDN | ApiGateway | API_CALL |
+| CDN | RateLimiter | API_CALL |
+| CDN | LoadBalancer | API_CALL |
+| CDN | Service | API_CALL |
+| ApiGateway | RateLimiter | API_CALL |
+| ApiGateway | LoadBalancer | API_CALL |
+| ApiGateway | Service | API_CALL |
+| LoadBalancer | Service | API_CALL |
+| LoadBalancer | WebSocketService | API_CALL |
+| Service | Service | API_CALL |
+| Service | Cache | CACHE_CALL |
+| Service | Database | DB_CALL |
+| Service | ObjectStorage | API_CALL |
+| Service | WebSocketService | API_CALL |
+| Service | EventStream | KAFKA_EVENT |
+| RateLimiter | LoadBalancer | API_CALL |
+| RateLimiter | Service | API_CALL |
+| WebSocketService | Service | API_CALL |
+| WebSocketService | Database | DB_CALL |
+| WebSocketService | EventStream | KAFKA_EVENT |
+| GeoDns | CDN | API_CALL |
+| GeoDns | ApiGateway | API_CALL |
+| GeoDns | RateLimiter | API_CALL |
+| GeoDns | LoadBalancer | API_CALL |
+| GeoDns | Service | API_CALL |
+| EventStream | Service | KAFKA_EVENT |
+| EventStream | Worker | KAFKA_EVENT |
+| EventStream | StreamProcessor | KAFKA_EVENT |
+| Worker | Service | API_CALL |
+| Worker | Database | DB_CALL |
+| Worker | ObjectStorage | API_CALL |
+| Worker | EventStream | KAFKA_EVENT |
+| Worker | Cache | CACHE_CALL |
+| Worker | WebSocketService | API_CALL |
+| StreamProcessor | EventStream | KAFKA_EVENT |
+| StreamProcessor | Service | API_CALL |
+| StreamProcessor | Database | DB_CALL |
+
+## 4. Edges
+
+Each edge is an object with `source` and `target` (component ids). For a
+typed edge, add `edge_type` and bind it to a contract on the TARGET via
+`contract_id`. Other fields:
+
+- `label` — short canvas label (2-5 words). Recommended on every edge.
+- `source_handle` / `target_handle` — anchor points (see §6). Recommended.
+- `latency_ms` — network hop latency (client→edge ~15, intra-AZ ~3, cross-AZ ~5).
+- `operation` — for `DB_CALL` (default SELECT) and `CACHE_CALL` (default GET).
+  **Set it explicitly for writes** (e.g. `INSERT`, `SET`).
+- `input_bindings` — for edges whose SOURCE has contracts (Service/WebSocketService
+  → Cache/Database/EventStream). Declares which source endpoint drives the call.
+
+### Edge types
+
+| edge_type | Used for | Bound to | Default op |
+|---|---|---|---|
+| API_CALL | HTTP call to a Service / ApiGateway / ObjectStorage / WebSocketService. | A target Service endpoint (endpoints[].id). Non-contract targets (LB, CDN, Worker) need no contract. | — |
+| CACHE_CALL | Cache read/write from a Service or Worker. | A target Cache space (cacheSpaces[].id). | GET |
+| DB_CALL | Database query from a Service, Worker, WebSocketService, or StreamProcessor. | A target Database table (tables[].id). | SELECT |
+| KAFKA_EVENT | Publish to / consume from an EventStream. | A target EventStream topic (topics[].id). | — |
+
+## 5. Contracts (functional detail)
+
+Define the functional surface on the component, then reference it from the
+edge by `contract_id`. Never hardcode edge metadata.
+
+- **Service `endpoints`**: `{ id, method, path, summary, description, requestBody[] }`.
+  Each requestBody field: `{ name, field_type, required, description }`.
+- **Cache `cacheSpaces`**: `{ id, name, keyPattern, defaultTtlSeconds, valueFields[] }`.
+- **Database `tables`**: `{ id, name, primaryKey, columns[] }`.
+  Each column: `{ name, field_type, required, description }`.
+- **EventStream `topics`**: `{ id, name, partitionKey, schema[] }`.
+
+## 6. Handles
+
+Edges may anchor to fixed handle ids. Pick by relative direction:
+right → `source-right-1` / `target-left-1`; down → `source-bottom-2` /
+`target-top-2`; up → `source-top-2` / `target-bottom-2`. Full set:
+
+```
+source-left-1, source-left-2, source-right-1, source-right-2, source-top-1, source-top-2, source-top-3, source-bottom-1, source-bottom-2, source-bottom-3, target-left-1, target-left-2, target-right-1, target-right-2, target-top-1, target-top-2, target-top-3, target-bottom-1, target-bottom-2, target-bottom-3
+```
+
+## 7. Cloud providers
+
+Designs are provider-neutral. After import, each component can be mapped to
+a provider's managed service for cost estimation. Supported providers:
+- generic — Generic (provider-neutral)
+- aws — Amazon Web Services
+- azure — Microsoft Azure
+- gcp — Google Cloud Platform
+
+## 8. Minimal example
+
+```yaml
+system_name: "Minimal Example"
+entry_points:
+  - client
+components:
+  client:
+    type: Client
+    position: { x: 40, y: 40 }
+  api:
+    type: Service
+    position: { x: 400, y: 40 }
+    pods: 2
+    threads_per_pod: 100
+    endpoints:
+      - id: ep_hello
+        method: GET
+        path: /api/v1/hello
+        summary: "Return a greeting"
+        description: "Stateless health/demo endpoint."
+edges:
+  - source: client
+    target: api
+    edge_type: API_CALL
+    contract_id: ep_hello
+    label: "Say Hello"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 15
+```
+
+## 9. Full example (URL shortener)
+
+```yaml
+system_name: "URL Shortener (example)"
+description: >
+  Read-heavy link redirector: write path creates short codes, read path
+  resolves them via cache-aside over PostgreSQL.
+entry_points:
+  - client
+
+components:
+  client:
+    type: Client
+    position: { x: 40, y: 220 }
+
+  gateway:
+    type: ApiGateway
+    position: { x: 400, y: 220 }
+    auth_enabled: false
+    max_concurrent_requests: 20000
+
+  url_service:
+    type: Service
+    position: { x: 760, y: 220 }
+    pods: 6
+    threads_per_pod: 100
+    cpu_cores: 4
+    processing_time_ms: 6
+    total_response_time_ms: 25
+    endpoints:
+      - id: ep_create
+        method: POST
+        path: /api/v1/urls
+        summary: "Create a short URL"
+        description: "Generates a unique short code, persists the mapping, returns the short URL."
+        requestBody:
+          - { name: long_url, field_type: string, required: true, description: "Destination URL" }
+      - id: ep_redirect
+        method: GET
+        path: /api/v1/{code}
+        summary: "Resolve a short code"
+        description: "Cache-aside lookup; falls back to the database on a miss. Idempotent."
+        requestBody:
+          - { name: code, field_type: string, required: true, description: "7-char Base62 code" }
+
+  url_cache:
+    type: Cache
+    position: { x: 1120, y: 40 }
+    cache_size_mb: 4000
+    working_set_mb: 8000
+    access_pattern: zipfian
+    cacheSpaces:
+      - id: cs_codes
+        name: "Code Mappings"
+        keyPattern: "url:{code}"
+        defaultTtlSeconds: 300
+        valueFields:
+          - { name: long_url, field_type: string, required: true, description: "Destination URL" }
+
+  url_db:
+    type: Database
+    position: { x: 1120, y: 400 }
+    max_connections: 200
+    replicas: 2
+    tables:
+      - id: tbl_urls
+        name: urls
+        primaryKey: code
+        columns:
+          - { name: code, field_type: string, required: true, description: "Short code (PK)" }
+          - { name: long_url, field_type: string, required: true, description: "Destination URL" }
+
+edges:
+  - source: client
+    target: gateway
+    edge_type: API_CALL
+    label: "Client Requests"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 15
+
+  - source: gateway
+    target: url_service
+    edge_type: API_CALL
+    contract_id: ep_redirect
+    label: "Resolve / Create"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  # Read path: cache GET (default operation for CACHE_CALL).
+  - source: url_service
+    target: url_cache
+    edge_type: CACHE_CALL
+    contract_id: cs_codes
+    operation: GET
+    label: "Get Cached Code"
+    source_handle: source-top-2
+    target_handle: target-bottom-2
+    latency_ms: 2
+    input_bindings:
+      - id: ib_read
+        source_contract_id: ep_redirect
+        label: "GET /api/v1/{code}"
+        field_mappings: []
+
+  # Write path: DB INSERT — operation MUST be set (default is SELECT).
+  - source: url_service
+    target: url_db
+    edge_type: DB_CALL
+    contract_id: tbl_urls
+    operation: INSERT
+    label: "Store Mapping"
+    source_handle: source-bottom-2
+    target_handle: target-top-2
+    latency_ms: 3
+    input_bindings:
+      - id: ib_write
+        source_contract_id: ep_create
+        label: "POST /api/v1/urls"
+        field_mappings: []
+```
+
+## 10. Checklist before returning YAML
+
+- [ ] `components` is a map, `edges` is an array.
+- [ ] Every component has a unique id, a valid `type`, and a `position`.
+- [ ] Every edge source/target is a valid pair from §3 with an allowed `edge_type`.
+- [ ] Typed edges set `contract_id` to an id that exists on the target.
+- [ ] `DB_CALL`/`CACHE_CALL` writes set `operation` explicitly.
+- [ ] Service→data-store edges include `input_bindings`.
+- [ ] `entry_points` lists the Client id(s).

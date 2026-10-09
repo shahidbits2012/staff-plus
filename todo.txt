@@ -1,0 +1,43 @@
+------
+We want to create chat system design in Vetora platform. Can you go through the Vetora doc - @ and come up with the high-level architecture and design for a chat system as we have designed.
+
+------
+Lets work on the branding a bit. We need to display it as Lifetime Free/100% Free, community building, public gitrepo, etc. Make the home page a bit more professional like any other site. Keep the UI modern.
+
+------
+Create a promote.sh script in scripts folder which publishes the changes to github. It should accept the pat as a command line arg.
+
+------
+Design preview url - Use the following URL format to render the design in our pages.
+http://localhost:3000/preview?url=http://localhost:3050/designs/chat-system.vetora.yaml
+You can add it to iframe present in chat system design page.
+
+Configure the hostnames in config files
+vetora hostname = http://localhost:3000
+staff plus hostname = http://localhost:3050
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
+------
