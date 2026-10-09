@@ -2,9 +2,12 @@ system_name: "Chat System (WhatsApp / Slack)"
 description: >
   Real-time E2E-encrypted messaging. WebSocket hot path for delivery, REST cold
   path for chat/participant management and inbox sync. Messaging Service persists
-  ciphertext to Cassandra, pushes real-time via the WebSocket layer, and publishes
-  to Kafka for durable write-time fan-out. A Fan-out Worker writes per-user inbox
-  entries to Redis and emits notification events consumed by a Notification Worker.
+  ciphertext to Cassandra and publishes to Kafka for durable write-time fan-out.
+  The Fan-out Worker writes per-user inbox entries to Redis, pushes to recipients
+  that are online over their already-open WebSocket (no server->WS edge is drawn:
+  a WebSocketService owns no contracts, so such an edge would resolve back into
+  the sending Services and form a cycle), and emits notification events that the
+  Notification Worker turns into APNs/FCM pushes for offline users.
 entry_points:
   - client
 
@@ -303,6 +306,16 @@ components:
     size_latency_factor_ms_per_mb: 4
     max_concurrent_requests: 20000
     presigned_url_enabled: true
+    buckets:
+      - id: bkt_media
+        name: chat-media
+        description: "Client-side encrypted attachments and thumbnails. Written via pre-signed URL."
+        keyPattern: "media/{chatId}/{messageId}/file.enc"
+        averageObjectSizeMb: 2
+        objectFields:
+          - { name: content_type, field_type: string, required: true, description: "MIME type of the encrypted blob" }
+          - { name: size_bytes, field_type: number, required: true, description: "Encrypted payload size" }
+          - { name: chat_id, field_type: string, required: true, description: "Owning chat id" }
 
   # ---------------- Async consumers ----------------
   fanout_worker:
@@ -323,9 +336,12 @@ components:
 
 edges:
   # ===== Entry =====
+  # Contract-less hops (ApiGateway / LoadBalancer / WebSocketService) bind to
+  # the endpoint on the Service they ultimately reach — see spec §4.1.
   - source: client
     target: api_gateway
     edge_type: API_CALL
+    contract_id: ep_create_chat
     label: "REST (cold path)"
     source_handle: source-right-1
     target_handle: target-left-1
@@ -334,6 +350,7 @@ edges:
   - source: client
     target: ws_lb
     edge_type: API_CALL
+    contract_id: ep_send_message
     label: "WebSocket connect"
     source_handle: source-bottom-1
     target_handle: target-left-1
@@ -342,6 +359,7 @@ edges:
   - source: ws_lb
     target: connection_ws
     edge_type: API_CALL
+    contract_id: ep_send_message
     label: "Route connection"
     source_handle: source-right-1
     target_handle: target-left-1
@@ -412,14 +430,17 @@ edges:
     source_handle: source-top-1
     target_handle: target-left-2
     latency_ms: 3
+    input_bindings:
+      - id: ib_msg_members
+        source_contract_id: ep_send_message
+        label: "POST /api/v1/messages"
+        field_mappings: []
 
-  - source: message_service
-    target: connection_ws
-    edge_type: API_CALL
-    label: "Real-time push"
-    source_handle: source-left-1
-    target_handle: target-top-1
-    latency_ms: 3
+  # NOTE: no message_service -> connection_ws edge. A WebSocketService owns no
+  # contracts, so a server->WS push edge resolves back to the Services behind it
+  # and forms a cycle (spec §4.1). Real-time delivery to online recipients is
+  # performed by the Connection Service over the already-open socket, driven by
+  # the async fan-out path below.
 
   - source: message_service
     target: cassandra
@@ -592,20 +613,34 @@ edges:
   - source: media_service
     target: s3
     edge_type: API_CALL
+    contract_id: bkt_media
+    operation: PUT
     label: "Sign / verify object"
     source_handle: source-right-1
     target_handle: target-left-1
     latency_ms: 5
+    input_bindings:
+      - id: ib_media_put
+        source_contract_id: ep_request_upload
+        label: "POST /api/v1/media/upload-url"
+        field_mappings: []
 
   # ===== Async fan-out =====
+  # EventStream -> Worker consume: contract_id and source_contract_id both
+  # reference the topic on the SOURCE stream (spec §4.1).
   - source: kafka
     target: fanout_worker
     edge_type: KAFKA_EVENT
     contract_id: topic_message_fanout
-    label: "Consume fan-out"
+    label: "Consume fan-out; push to online"
     source_handle: source-right-1
     target_handle: target-left-1
     latency_ms: 5
+    input_bindings:
+      - id: ib_consume_fanout
+        source_contract_id: topic_message_fanout
+        label: "message-fanout"
+        field_mappings: []
 
   - source: fanout_worker
     target: redis
@@ -634,6 +669,11 @@ edges:
     source_handle: source-right-2
     target_handle: target-left-1
     latency_ms: 5
+    input_bindings:
+      - id: ib_consume_notifications
+        source_contract_id: topic_notifications
+        label: "notifications"
+        field_mappings: []
 
   - source: notification_worker
     target: user_service
