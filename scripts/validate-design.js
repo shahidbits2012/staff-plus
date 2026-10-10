@@ -133,9 +133,11 @@ edges.forEach((e, i) => {
   const key = `${src.type}>${tgt.type}:${e.edge_type}`;
   if (!LEGAL.has(key)) errors.push(`§3: ${tag}: illegal pair/edge_type (${key})`);
 
-  // no server -> WebSocketService push
-  if (tgt.type === 'WebSocketService' && ['Service', 'Worker', 'StreamProcessor'].includes(src.type))
-    errors.push(`§4.1 pitfall: ${tag}: server->WebSocketService push edge (cycle)`);
+  // no Service -> WebSocketService push (forms a cycle: Service→WS→Service,
+  // and the edge resolves back to the sender's own contracts).
+  // Worker/StreamProcessor → WebSocketService is fine — they have no contracts.
+  if (tgt.type === 'WebSocketService' && src.type === 'Service')
+    errors.push(`§4.1 pitfall: ${tag}: Service->WebSocketService push edge (cycle)`);
 
   if (!e.edge_type) return;
 

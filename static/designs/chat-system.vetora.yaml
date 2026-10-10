@@ -643,6 +643,15 @@ edges:
         field_mappings: []
 
   - source: fanout_worker
+    target: connection_ws
+    edge_type: API_CALL
+    contract_id: ep_send_message
+    label: "Push to online users"
+    source_handle: source-top-2
+    target_handle: target-right-1
+    latency_ms: 3
+
+  - source: fanout_worker
     target: redis
     edge_type: CACHE_CALL
     contract_id: cs_inbox

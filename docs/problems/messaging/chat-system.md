@@ -7,10 +7,6 @@ title: Chat System (e.g. WhatsApp / Slack)
 
 Design a real-time messaging system similar to WhatsApp or Slack.
 
-## Design
-
-<DesignPreview file="chat-system.vetora.yaml" height={600} title="Chat System — Vetora Design" />
-
 ## 1. Requirements
 
 ### Functional Requirements
@@ -357,8 +353,16 @@ These serve different concerns. Redis Streams handles the "deliver now" path. Ka
 
 ```mermaid
 graph TD
-    A[Alpha] --> B[Beta]
-    B --> C[Gamma]
+    CS[Messaging Service] -->|"1. persist"| CASS[(Cassandra)]
+    CS -->|"2. publish"| KAFKA[Kafka]
+    CS -->|"3. lookup online"| REDIS[(Redis Registry)]
+    CS -->|"4. push online"| RS[Connection Service]
+
+    KAFKA --> FOS[Fan-out Worker]
+    FOS -->|"fetch members"| CACHE[(Redis Cache)]
+    FOS -->|"write per-user"| INBOX[(Redis Inbox)]
+    FOS -->|"offline users"| NOTIF[Kafka notifications]
+    NOTIF --> NW[Notification Worker]
 ```
 
 **Step by step:**
@@ -507,19 +511,19 @@ Since messages are deleted after all participants ACK:
 
 **Problem:** How do we notify offline users that they have new messages?
 
-The Notification Service subscribes to Redis Streams (same streams used for server-to-server delivery). When the Fan-out Service writes an Inbox entry for an offline user, it also publishes to a dedicated notification stream. See [Push Notifications (APNs / FCM)](/building-blocks/push-notifications) for the delivery mechanism.
+The Notification Worker consumes from the Kafka `notifications` topic. When the Fan-out Worker writes an Inbox entry for an offline user, it also publishes a notification event to Kafka. See [Push Notifications (APNs / FCM)](/building-blocks/push-notifications) for the delivery mechanism.
 
 #### Flow
 
 ```
-Fan-out Service:
+Fan-out Worker:
   1. Lookup user in Connection Registry
   2. User is offline (no entry)
   3. Write Inbox entry (Redis sorted set)
-  4. Publish to stream:notifications { userId, chatId, senderName, preview }
+  4. Publish to Kafka topic:notifications { userId, chatId, senderName, preview }
 
-Notification Service:
-  1. Consumes from stream:notifications
+Notification Worker:
+  1. Consumes from Kafka topic:notifications
   2. Looks up user's device tokens (from User Service / Client table)
   3. Sends push notification via APNs (iOS) / FCM (Android)
 ```
@@ -528,7 +532,7 @@ Notification Service:
 
 | Decision | Choice | Why |
 |----------|--------|-----|
-| Delivery mechanism | Redis Streams | Already using for server-to-server; durable, replayable if Notification Service is down |
+| Delivery mechanism | Kafka (`notifications` topic) | Durable, replayable if Notification Worker is down; same pipeline pattern as message fan-out |
 | Push notification content | Sender name + "new message" (no content preview) | E2E encrypted — server can't read the message to generate a preview |
 | Purpose of push notification | **Signal to open the app**, not message delivery | Push is best-effort, size-limited (4KB), no ordering guarantees |
 | Batching | Batch multiple notifications per user (max 1 push per 5 seconds) | Avoid notification spam when user receives 50 messages in a group while offline |
@@ -578,11 +582,13 @@ After all deep dives, the system has evolved from a single Chat Server to a full
 | **Chat Service** | Chat, ChatParticipants | PostgreSQL + Redis cache | Stateless, publishes membership events to Kafka |
 | **Messaging Service** | Message, MessageStatus | Cassandra + Redis | Stateless, high throughput |
 | **Inbox Service** | Inbox | Redis (sorted sets) | IO-bound, high write/delete churn |
-| **Fan-out Service** | Kafka consumer — orchestrates Inbox writes + notifications | — (stateless) | CPU-bound, scales with Kafka partitions |
+| **Fan-out Worker** | Kafka consumer — orchestrates Inbox writes + notifications | — (stateless) | CPU-bound, scales with Kafka partitions |
 | **Media Service** | Pre-signed URL generation, S3 lifecycle | S3 | Stateless, lightweight |
-| **Notification Service** | Push notifications (APNs/FCM) | Redis Streams consumer | Async, rate-limited by platform APIs |
+| **Notification Worker** | Push notifications (APNs/FCM) | Kafka consumer (`notifications` topic) | Async, rate-limited by platform APIs |
 
 #### Architecture Diagram
+
+<DesignPreview file="chat-system.vetora.yaml" height={600} title="Chat System — Final Architecture (Vetora)" />
 
 ```mermaid
 graph LR
@@ -605,8 +611,8 @@ graph LR
 
     subgraph Async_Pipeline[Async Pipeline]
         KF[Kafka]
-        FOS[Fan-out Service]
-        NS[Notification Service]
+        FOS[Fan-out Worker]
+        NS[Notification Worker]
     end
 
     subgraph Data_Stores[Data Stores]
@@ -649,9 +655,10 @@ graph LR
 | Client → Connection Service | WebSocket | Real-time bidirectional |
 | Connection Service → Messaging Service | [gRPC](/building-blocks/grpc) | Low-latency, typed contracts |
 | Messaging Service → Kafka | Kafka produce | Durable async fan-out (partitioned by chatId) |
-| Kafka → Fan-out Service | Kafka consume | Scalable, replayable, ordered per chat |
-| Fan-out Service → Inbox Service | [gRPC](/building-blocks/grpc) | Write inbox entries |
-| Fan-out Service → Notification Service | Redis Streams | Push notifications for offline users |
+| Kafka → Fan-out Worker | Kafka consume | Scalable, replayable, ordered per chat |
+| Fan-out Worker → Redis (Inbox) | CACHE_CALL (Redis sorted set) | Write per-user inbox entries directly |
+| Fan-out Worker → Kafka (`notifications`) | Kafka produce | Notification events for offline users |
+| Kafka → Notification Worker | Kafka consume | Durable, replayable notification delivery |
 | Messaging Service → Connection Service | [Redis Streams](/building-blocks/server-to-server-communication) | Real-time delivery to online users |
 | Chat Service → Kafka | Kafka produce | Membership change events for cache invalidation |
 | Client → Media Service | REST | Pre-signed URL request |
@@ -662,9 +669,9 @@ graph LR
 |-------|--------------|----------------|
 | **[PostgreSQL](/building-blocks/postgresql)** | User, Client, Chat, ChatParticipants | Small, relational, strong consistency |
 | **Cassandra** | Message (ciphertext) | Massive write volume, partitioned by chatId, time-bucketed |
-| **Redis Cluster** | Connection Registry, Inbox (sorted sets), MessageStatus (hashes), Presence (TTL keys), ChatParticipants cache, Redis Streams | Sub-ms latency, rich data structures, clean deletes |
+| **Redis Cluster** | Connection Registry, Inbox (sorted sets), MessageStatus (hashes), Presence (TTL keys), ChatParticipants cache | Sub-ms latency, rich data structures, clean deletes |
 | **S3** | Encrypted media files | Virtually unlimited, 11-nines durability, pre-signed URL access |
-| **Kafka** | message-fanout topic, membership-events topic | Durable async pipeline, ordering per chat, replay on failure |
+| **Kafka** | message-fanout topic, notifications topic, membership-events topic | Durable async pipeline, ordering per chat, replay on failure |
 
 ---
 
@@ -691,7 +698,7 @@ Autoscaling reacts in minutes — too slow for a spike that happens in seconds.
 | Mitigation | How |
 |------------|-----|
 | **Chat-level [rate limiting](/patterns/rate-limiting)** | Max 10 msgs/sec per chat. Sender gets "slow down" response. This is what WhatsApp does for broadcast lists. |
-| **Batched Inbox writes** | Fan-out Service batches multiple messages for the same chat before writing. Instead of 500 writes × 100 msgs = 50K writes, batch into 500 writes containing 100 messages each. |
+| **Batched Inbox writes** | Fan-out Worker batches multiple messages for the same chat before writing. Instead of 500 writes × 100 msgs = 50K writes, batch into 500 writes containing 100 messages each. |
 | **Switch to [read-time fan-out](/patterns/fan-out)** | Detect when a chat exceeds threshold (e.g., > 50 msgs/min) → stop writing per-user Inbox entries → store in per-chat stream instead → members pull from the stream. This is the Discord channel model. |
 
 Decision: **Rate-limit + batched writes** for simplicity. Switch to read-time fan-out only if hot chats become a sustained pattern.
@@ -713,13 +720,13 @@ Messaging Service → Kafka (producer backs up)
   ├── Async produce: don't wait for Kafka ACK before responding
   └── Producer backpressure: bounded in-flight requests
 
-Kafka → Fan-out Service (consumer lag grows)
+Kafka → Fan-out Worker (consumer lag grows)
   ├── Monitor: alert at > 10s lag, page at > 60s
   ├── Auto-scale consumers up to partition count
-  ├── Shed load: pause receipt processing, prioritize delivery
-  └── Separate consumer groups for receipts vs messages
+  ├── Shed load: pause notification events, prioritize delivery
+  └── Separate consumer groups for notifications vs fan-out
 
-Fan-out Service → Inbox Service / Redis (slow)
+Fan-out Worker → Redis (slow)
   ├── Bulkhead: separate Redis pools for Inbox vs Connection Registry
   ├── Retry with backoff, dead-letter for failed writes
   └── Inbox pressure can't starve routing
@@ -758,7 +765,7 @@ Fan-out Service → Inbox Service / Redis (slow)
 | **Cassandra** | Node down | Message persistence fails for affected partitions | RF=3 + LOCAL_QUORUM survives 1 failure; hinted handoff replays |
 | **Kafka broker** | Broker down | Fan-out stalled for affected partitions | Leader election to surviving broker (~seconds); real-time path unaffected |
 | **Messaging Service** | All instances down | No new messages processed | Kafka buffers; Connection Service circuit breaker returns "try later" |
-| **Fan-out Service** | All instances down | No Inbox writes, no push notifications | Kafka retains messages; restart consumers, replay from last offset |
+| **Fan-out Worker** | All instances down | No Inbox writes, no push notifications | Kafka retains messages; restart consumers, replay from last offset |
 | **Inbox Redis full** | Memory exhaustion | Can't write new Inbox entries | Alert on memory; entries are transient (deleted on ACK) — growing Inbox means users aren't syncing; evict oldest with Cassandra fallback |
 
 ## 7. Trade-offs & Alternatives
