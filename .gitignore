@@ -5,3 +5,8 @@ build/
 .DS_Store
 *.log
 .idea/
+
+# Lockfile is not committed: local installs resolve through an internal
+# mirror, which pins versions that don't exist on public npm. CI resolves
+# fresh from registry.npmjs.org (see .npmrc).
+package-lock.json
