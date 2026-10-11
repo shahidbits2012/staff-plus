@@ -31,7 +31,7 @@ Example:
 
 Every system design problem follows this structure:
 
-1. **Requirements** — Functional (numbered), Non-Functional (numbered), Out of Scope
+1. **Requirements** — Functional (numbered), Non-Functional (use **LSDARO** framework, numbered), Out of Scope
 2. **Core Entities** — 3-5 key data objects with brief descriptions
 3. **API / Interface** — Client→Server frames, Server→Client frames, REST APIs (cold path)
 4. **High-Level Design** — Architecture diagram + data model + how each FR is satisfied
@@ -75,10 +75,21 @@ Decision: [Which approach and WHY]
   - When to revisit
 ```
 
+### LSDARO — NFR Framework
+
+Every problem page should evaluate NFRs using the **LSDARO** checklist. Not every dimension applies to every problem — include only those that drive architectural decisions, but always consider all six:
+
+1. **L**atency — response time SLOs (p50, p99)
+2. **S**cale — throughput (rps), data volume, concurrent users
+3. **D**urability — zero data loss guarantees, persistence requirements
+4. **A**vailability — uptime SLO (99.9%, 99.99%), fail-open vs fail-closed
+5. **R**esiliency — fault tolerance across component failures, graceful degradation
+6. **O**bservability — metrics, alerting, tracing required for operations
+
 ## Content Rules
 
 - Keep problem pages focused on the specific design decisions. Generic knowledge → separate page + link.
-- All entities, schemas, and data models discussed during the design conversation should be reflected in the HLD section.
+- All entities, schemas, and data models discussed during the design conversation should be reflected in the HLD section. Data models use tabular format: `Field | Type | Description | Example`.
 - Media metadata (URL, type, size) is embedded in the Message entity for simplicity. Revisit if media pipeline becomes a deep dive.
 - Message rows are ephemeral — deleted after all participants ACK (E2E encryption model).
 - Receipts (delivered/read) use MessageStatus table (updated in-place), NOT the Inbox table (avoids write amplification).

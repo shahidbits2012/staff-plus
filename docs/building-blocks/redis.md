@@ -153,7 +153,7 @@ Use **no persistence** for pure cache (group membership cache, session cache).
 
 ### How It Works
 
-Redis Cluster shards data across multiple nodes using **hash slots** (16,384 slots total).
+Redis Cluster shards data across multiple nodes using **hash slots** (16,384 fixed slots).
 
 ```
 slot = CRC16(key) % 16384
@@ -163,14 +163,65 @@ Each node owns a range of slots. Keys are automatically routed to the correct no
 
 ```mermaid
 graph LR
-    subgraph "Redis Cluster"
+    subgraph Redis_Cluster[Redis Cluster]
         M1[Node 1<br/>slots 0-5460<br/>+ Replica]
         M2[Node 2<br/>slots 5461-10922<br/>+ Replica]
         M3[Node 3<br/>slots 10923-16383<br/>+ Replica]
     end
-    
+
     C[Client] -->|"CRC16(key) % 16384"| M2
 ```
+
+### Key Lookup: Hash Slots vs Other Approaches
+
+Redis Cluster chose **hash slots** over consistent hashing or modulo hashing. Here's why:
+
+| Approach | How | Remapping on node change | Used by |
+|----------|-----|------------------------|---------|
+| **Modulo hashing** | `shard = hash(key) % N` | ~All keys remap (catastrophic) | Simple caches |
+| **[Consistent hashing](/distributed-systems/consistent-hashing)** | Keys and nodes on a ring; key → next node clockwise | ~1/N keys remap | Cassandra, DynamoDB, Memcached |
+| **Hash slots (Redis)** | 16384 fixed slots; `CRC16(key) % 16384`; each node owns a slot range | Only slots being moved — exact control | Redis Cluster |
+
+**Why Redis chose hash slots over consistent hashing:**
+
+1. **Deterministic resharding** — you choose exactly which slots move to which node. Consistent hashing remaps are implicit (depends on ring position).
+2. **Simple metadata** — each node stores a 16384-bit bitmap (2KB) of slot ownership. Consistent hashing needs a sorted list of vnodes.
+3. **No virtual nodes needed** — hash slots are inherently balanced (each node gets `16384 / N` slots). Consistent hashing needs 150+ vnodes per node for balance.
+4. **Cluster gossip is lightweight** — nodes exchange slot bitmaps, not ring topology.
+
+**Trade-off:** fixed max of 16384 shards (practically ~1000 recommended). Consistent hashing has no such limit. For Redis's use case (data fits in memory, clusters rarely exceed 100 nodes), 16384 is more than sufficient.
+
+### How Key Routing Works
+
+```
+1. Client computes: slot = CRC16(key) % 16384
+2. Client has a cached slot→node mapping (received on connect)
+3. Client sends command directly to the correct node
+4. If wrong node (slot migrated): node returns MOVED redirect
+5. Client updates its slot map and retries
+```
+
+During resharding (slot migration), a node may return `ASK` (temporary redirect for in-flight slots) or `MOVED` (permanent — update your map).
+
+### Hash Tags — Key Co-location
+
+Multi-key operations (`MGET`, `PIPELINE`, Lua scripts) require all keys on the **same slot**. Hash tags force co-location:
+
+```
+Key: "rl:{rule-001:sk-abc123}:28284218"
+     Only the {rule-001:sk-abc123} portion is hashed.
+     Both window keys land on the same slot.
+
+Key: "{userId}:inbox"  and  "{userId}:status"
+     Both hash on userId → same slot → pipelined reads work.
+```
+
+**Rule:** if the key contains `{...}`, only the content between the first `{` and first `}` is hashed. Otherwise, the entire key is hashed.
+
+**Use cases:**
+- Rate limiter: current + previous window counters on the same slot for pipelined `GET + INCR`
+- Chat: inbox + message status for the same user on the same slot
+- Transactions: all keys in a `MULTI/EXEC` block must share a slot
 
 ### Replication & Failover
 
@@ -181,18 +232,20 @@ graph LR
 
 ### Scaling
 
-- **Add nodes** → cluster rebalances slots automatically
-- **Linear read scaling** with read replicas
+- **Add nodes** → cluster rebalances slots automatically (move slot ranges)
+- **Linear read scaling** with read replicas (`READONLY` command on replicas)
 - Typical setup: 6 nodes (3 masters + 3 replicas) for production
+- Resharding is online — slots migrate in background while serving traffic
 
 ### Limitations
 
-| Limitation | Impact |
-|-----------|--------|
-| Multi-key operations must be on the same slot | Use hash tags: `{userId}:inbox` and `{userId}:status` → same slot |
-| Cross-slot transactions not supported | Design data model so related keys share a slot |
-| Async replication → small data loss window on failover | Accept for ephemeral data; use AOF for important data |
-| Memory-bound — all data must fit in RAM | Monitor memory; use eviction policies or TTL |
+| Limitation | Impact | Mitigation |
+|-----------|--------|------------|
+| Multi-key ops must be on the same slot | Pipeline/Lua across slots fails | Use hash tags: `{userId}:inbox` and `{userId}:status` → same slot |
+| Cross-slot transactions not supported | Can't MULTI/EXEC across slots | Design data model so related keys share a slot |
+| Async replication → small data loss on failover | Writes acked but not replicated are lost | `min-replicas-to-write 1` for critical data; accept for ephemeral data |
+| Memory-bound — all data in RAM | Cost and capacity limits | Monitor memory; use eviction + TTL; tier cold data to disk |
+| Max ~1000 nodes (16384 slots) | Upper bound on cluster size | Sufficient for most use cases; beyond this, consider client-side partitioning |
 
 ## Eviction Policies
 
@@ -243,3 +296,5 @@ When Redis hits the memory limit, it evicts keys based on the configured policy:
 - [Cassandra](/building-blocks/cassandra) — when you need durable storage for massive write volumes
 - [SQL vs NoSQL](/decisions/sql-vs-nosql) — decision framework for database selection
 - [WebSocket Connection Management](/building-blocks/websocket-connection-management) — Redis as connection registry
+- [Sharding & Partitioning](/distributed-systems/sharding) — hash slots in the context of sharding approaches
+- [Consistent Hashing](/distributed-systems/consistent-hashing) — the alternative Redis chose not to use (and why)
