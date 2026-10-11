@@ -10,23 +10,26 @@ Design a real-time messaging system similar to WhatsApp or Slack.
 ## 1. Requirements
 
 ### Functional Requirements
-1. User should be able to create a chat (individual or group) — handled similarly
-2. User should be able to add or remove participants in a chat
-3. User should be able to send and receive text messages in a chat
-4. User should receive all chat messages sent while offline
-5. User should be able to upload and share media files (images, videos) in a chat
-6. User should see message delivery and read receipts
-7. User should be able to search messages within a chat
-8. User should see other users' online status and "last seen" time
+1. **FR1**: User should be able to create a chat (individual or group) — handled similarly
+2. **FR2**: User should be able to add or remove participants in a chat
+3. **FR3**: User should be able to send and receive text messages in a chat
+4. **FR4**: User should receive all chat messages sent while offline
+5. **FR5**: User should be able to upload and share media files (images, videos) in a chat
+6. **FR6**: User should see message delivery and read receipts
+7. **FR7**: User should be able to search messages within a chat
+8. **FR8**: User should see other users' online status and "last seen" time
 
-### Non-Functional Requirements
-1. **Latency**: Message delivery should be near real-time (&lt; 500ms)
-2. **Scale**: System should support 100 billion messages per day
-3. **Durability**: Zero message loss — guaranteed message delivery
-4. **E2E Encryption**: Messages must be end-to-end encrypted; server stores ciphertext only, deletes after delivery confirmation
-5. **Ordering**: Messages within a conversation must be ordered
-6. **Availability**: 99.99% uptime
-7. **Resilience**: System should be fault-tolerant across component failures
+### Non-Functional Requirements (LSDARO)
+1. **NFR1 — Latency**: Message delivery should be near real-time (&lt; 500ms)
+2. **NFR2 — Scale**: System should support 100 billion messages per day
+3. **NFR3 — Durability**: Zero message loss — guaranteed message delivery; E2E encrypted (server stores ciphertext only, deletes after delivery confirmation)
+4. **NFR4 — Availability**: 99.99% uptime
+5. **NFR5 — Resiliency**: System should be fault-tolerant across component failures; graceful degradation when individual components fail
+6. **NFR6 — Observability**: Message delivery latency (p50/p99), fan-out lag, connection registry health, per-service error rates
+
+**Additional constraints:**
+- **E2E Encryption**: Messages must be end-to-end encrypted; server cannot read content
+- **Ordering**: Messages within a conversation must be ordered
 
 ### Out of Scope
 - Audio/video calls
@@ -127,19 +130,71 @@ Messages are E2E encrypted and deleted from server after delivery confirmation. 
 
 ### Data Model
 
-```
-User:             id | name | phone | avatarUrl | lastSeen | createdAt
-Client:           id | userId | deviceName | platform | publicKeys
-Chat:             id | name | createdBy | createdAt
-ChatParticipants: id | chatId | userId | createdAt
-Message:          id | chatId | userId | content (ciphertext) | media | timestamp
-Inbox:            id | messageId | userId
-MessageStatus:    messageId | userId | status (delivered|read) | timestamp
-```
+**User**
 
-- **Inbox** — per-user undelivered message queue. Write on send, delete on ACK.
-- **Message** — transient. Deleted once all participants have ACKed (E2E encrypted, server can't read it anyway).
-- **MessageStatus** — receipt tracking. Updated in-place (not insert/delete like Inbox). Deleted with Message.
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| id | UUID | Primary key | `u-abc123` |
+| name | string | Display name | `"Alice"` |
+| phone | string | E.164 phone number | `"+14155551234"` |
+| avatarUrl | string | Profile image URL | `"s3://avatars/u-abc123.jpg"` |
+| lastSeen | timestamp | Last disconnect time (updated on disconnect only) | `2024-10-11T08:30:00Z` |
+| createdAt | timestamp | Account creation time | `2024-01-15T12:00:00Z` |
+
+**Client**
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| id | UUID | Primary key | `cl-xyz789` |
+| userId | UUID | FK → User | `u-abc123` |
+| deviceName | string | Human-readable device label | `"iPhone 15"` |
+| platform | enum | `ios` / `android` / `web` | `ios` |
+| publicKeys | jsonb | E2E encryption key bundle (identity, signed pre-key, one-time pre-keys) | `{...}` |
+
+**Chat**
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| id | UUID | Primary key | `chat-001` |
+| name | string | Group name (null for 1:1) | `"Engineering Team"` |
+| createdBy | UUID | FK → User | `u-abc123` |
+| createdAt | timestamp | Chat creation time | `2024-10-01T09:00:00Z` |
+
+**ChatParticipants**
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| chatId | UUID | FK → Chat (composite PK) | `chat-001` |
+| userId | UUID | FK → User (composite PK) | `u-abc123` |
+| createdAt | timestamp | When user joined the chat | `2024-10-01T09:00:00Z` |
+
+**Message** (Cassandra — transient, deleted after all participants ACK)
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| chatId | UUID | Partition key | `chat-001` |
+| timestamp | timestamp | Clustering key (DESC) | `2024-10-11T08:31:00Z` |
+| messageId | UUID | Unique message id | `msg-555` |
+| senderId | UUID | FK → User | `u-abc123` |
+| content | blob | E2E encrypted ciphertext | `<binary>` |
+| mediaUrl | string | Encrypted media S3 key (nullable) | `"media/chat-001/msg-555/file.enc"` |
+| mediaType | string | MIME type (nullable) | `"image/jpeg"` |
+
+**Inbox** (Redis sorted set — per-user undelivered queue; write on send, delete on ACK)
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| userId | string | Sorted set key: `inbox:{userId}` | `inbox:u-abc123` |
+| messageId | string | Member | `msg-555` |
+| timestamp | float | Score (epoch ms — natural ordering) | `1697013060000` |
+
+**MessageStatus** (Redis hash — receipt tracking; updated in-place, deleted with Message)
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| messageId | string | Hash key: `status:{messageId}` | `status:msg-555` |
+| userId | string | Hash field | `u-def456` |
+| status | enum | `SENT` / `DELIVERED` / `READ` | `DELIVERED` |
 
 ### Architecture
 
