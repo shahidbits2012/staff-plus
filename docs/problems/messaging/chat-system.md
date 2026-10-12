@@ -25,7 +25,7 @@ Design a real-time messaging system similar to WhatsApp or Slack.
 3. **NFR3 — Durability**: Zero message loss — guaranteed message delivery; E2E encrypted (server stores ciphertext only, deletes after delivery confirmation)
 4. **NFR4 — Availability**: 99.99% uptime
 5. **NFR5 — Resiliency**: System should be fault-tolerant across component failures; graceful degradation when individual components fail
-6. **NFR6 — Observability**: Message delivery latency (p50/p99), fan-out lag, connection registry health, per-service error rates
+6. **NFR6 — Observability**: Message delivery latency (p50/p99), fan-out lag, connection registry health, per-service error rates — see [§5.10 Observability](#510-observability)
 
 **Additional constraints:**
 - **E2E Encryption**: Messages must be end-to-end encrypted; server cannot read content
@@ -270,6 +270,10 @@ See [WebSocket Connection Management at Scale](/building-blocks/websocket-connec
 
 **When you'd need stronger ordering:** Collaborative editing (OT/CRDT), financial transactions, distributed databases. Not chat.
 
+:::staff[Deliberately choosing a weaker ordering guarantee]
+We trade strict total order for zero coordination: no per-chat sequencer means no single-writer hot spot and no extra hop on a 2.3M msg/s write path. The causal cases users actually perceive (same sender, reply-after-read) are already guaranteed by the connection model; we only give up a deterministic-but-arbitrary order for truly concurrent senders. Revisit when order becomes semantic — edits/deletes racing sends, polls, threaded replies — and then use per-chat sequence numbers (e.g., the Kafka offset of the chatId partition), not global clocks.
+:::
+
 ### 5.3 Database Selection
 
 **Problem:** At 100B messages/day, no single database handles everything. How do we choose the right store for each table?
@@ -306,6 +310,10 @@ Redis Inbox and MessageStatus are ephemeral but important. If Redis crashes:
 - **MessageStatus recovery:** Lost receipt statuses are acceptable — sender sees "sent" instead of "delivered" until the next interaction triggers a fresh status check.
 
 Redis AOF persistence (`appendfsync everysec`) limits data loss to ~1 second.
+
+:::staff[Pick stores by churn, and keep receipts out of the Inbox]
+Inbox and MessageStatus live in Redis because of **churn**, not volume: insert-then-delete and in-place status flips are tombstone generators in an LSM store like Cassandra. Receipts go to a per-message MessageStatus hash rather than through recipients' Inboxes — routing DELIVERED/READ events through the Inbox would add up to 2×N writes per group message (N = group size) and bloat every reconnect sync. Redis is treated as a cache of recoverable truth: Cassandra is the backstop, so losing Redis costs latency, not messages. Revisit if Redis memory cost is dominated by a long tail of never-syncing users — tier cold Inboxes back to Cassandra.
+:::
 
 #### Cassandra Schema for Messages
 
@@ -382,10 +390,16 @@ Client:
 
 #### Impact on Server Design
 
+:::staff[E2E encryption reshapes the server, not just the payload]
+The server becomes a blind router plus a transient store — every feature that needs content moves to the client or out of scope:
+
 - Server **cannot** provide search over messages (ciphertext only)
 - Server **cannot** provide message history to new devices (deleted after ACK)
 - Message content in Cassandra and Inbox entries are **ciphertext** — opaque blobs to the server
 - Spam detection and content moderation **cannot** operate on message content (out of scope, as specified)
+
+Second-order effect: because the server can't serve history, it doesn't need to keep it — which is what makes delete-on-ACK, TWCS SSTable drops, and a bounded Redis Inbox possible.
+:::
 
 ### 5.5 Write-Time Fan-Out
 
@@ -402,7 +416,9 @@ The system uses two separate messaging layers, running in parallel:
 | **Real-time delivery** | Redis Streams (per Chat Server) | Push to online users' WebSocket connections | ~2-5ms |
 | **Durable fan-out** | [Kafka](/building-blocks/kafka) (partitioned by chatId) | Persist Inbox entries for all participants | ~10-50ms |
 
-These serve different concerns. Redis Streams handles the "deliver now" path. Kafka handles the "make sure everyone eventually gets it" path.
+:::staff[Two messaging layers: "deliver now" vs. "everyone eventually"]
+These serve different concerns. Redis Streams handles the "deliver now" path. Kafka handles the "make sure everyone eventually gets it" path. Splitting them means the latency SLO and the durability SLO never fight over the same knob — Kafka's batching and `acks=all` would tax the hot path, while Redis alone can't replay. The price is two systems to operate and a duplicate-delivery window (WS push and Inbox entry can both reach a device), so clients dedupe on messageId. Revisit if Kafka p99 at our scale gets close to Redis Streams, or the ops cost of two pipelines outweighs the latency win.
+:::
 
 #### Write Flow
 
@@ -728,6 +744,90 @@ graph LR
 | **S3** | Encrypted media files | Virtually unlimited, 11-nines durability, pre-signed URL access |
 | **Kafka** | message-fanout topic, notifications topic, membership-events topic | Durable async pipeline, ordering per chat, replay on failure |
 
+### 5.10 Observability
+
+See [Observability](/foundations/observability) for the generic framework (metric layers, USE/RED, SLOs, burn-rate alerting, tracing, cardinality control). This section applies it to the final architecture above.
+
+**Problem:** A message crosses six hops — WS frame → Connection Service → Messaging Service → Cassandra/Kafka → Redis Stream → recipient socket — and can stall at any of them while every service still reports healthy. At 2.3M msgs/sec across ~235 stateful pods, how do we know messages are delivered within 500ms *before* users tell us, and pinpoint which hop is failing?
+
+#### Metrics by Layer
+
+| Layer | Metric | Why it matters | Alert |
+|-------|--------|----------------|-------|
+| **Infrastructure (USE)** | Open WebSocket connections per Connection Service pod | Capacity is ~640K/pod; skew means LB imbalance or a reconnect storm landing on few pods | Warn > 80% of pod capacity |
+| | File descriptor usage per pod | One socket = one fd; exhaustion silently rejects new connections | Page > 90% of ulimit |
+| | Heap usage + GC pause p99 (Connection Service) | ~50KB/connection; long pauses stall heartbeats → mass false disconnects + presence flapping | Warn GC p99 > 200ms |
+| | Pod restarts / OOMKills | Each restart = ~640K reconnects ([§6.1](#61-thundering-herd-on-deploy)) | Ticket on any OOMKill; page on repeated restarts across the fleet |
+| **Dependencies (DB / Cache / Queue)** | Redis Streams pending entries + lag per server stream | Real-time path backlog for one Chat Server; a stuck consumer = all its users stop receiving | Page if any stream lag > 5s |
+| | Kafka consumer lag — `message-fanout`, per partition | Inbox durability backstop falling behind; per-partition view isolates hot chats | Warn > 10s, page > 60s ([§6.3](#63-cascading-failure)) |
+| | Kafka consumer lag — `notifications` | Offline users aren't being woken | Ticket > 5 min |
+| | Cassandra p99 write latency + dropped mutations / unavailable errors | Message persistence on the send path at LOCAL_QUORUM | Warn p99 > 20ms; page on unavailable errors |
+| | Cassandra pending compactions + tombstones scanned per read | TWCS health — growth means deletes are fighting compaction | Ticket |
+| | Redis memory used + evictions (Inbox shards) | Evicted Inbox entries force the slow Cassandra fallback ([§6.5](#65-component-failure-summary)) | Warn > 75% memory; page on any Inbox eviction |
+| | Redis p99 latency + pool saturation, **per pool** (Registry vs Inbox) | Verifies the bulkhead — Inbox pressure must not starve routing | Warn p99 > 5ms |
+| | ChatParticipants cache hit ratio | Expected > 99.9%; a drop means PostgreSQL stampede on every send | Warn &lt; 99% |
+| | S3 PUT/HEAD error rate (5xx, 403 expired URL) | Media sends fail after the client already uploaded | Ticket |
+| **Application (RED)** | Rate / errors / duration per WS frame type (`SEND_MESSAGE`, `ACK`, `READ`, `REQUEST_UPLOAD`) | Per-frame RED catches a broken ACK path while sends look fine | Feeds SLO burn rate |
+| | gRPC Connection → Messaging p99 + circuit-breaker state | Open breaker = users get "try later" | Page if breaker open > 1 min |
+| | ACK timeout rate (pushed over WS, no ACK within N s) | Silent delivery failure — frame left the server but never reached the device | Warn > 1% |
+| | Fan-out writes/sec + batch size | Write amplification; early hot-chat signal ([§6.2](#62-hot-chat-viral-group)) | Ticket on sustained spike |
+| | Dead-letter queue depth (failed Inbox writes) | Should be ~0; growth = messages at risk | Page on growth |
+| **Business / Product** | Messages sent/sec vs. same time last week | A global drop is invisible to per-service error rates (no requests = no errors) | Page on > 20% drop vs. baseline |
+| | Inbox depth per user (p99, max) | Growing depth = users not syncing or ACK path broken | Warn on trend |
+| | Push-notification fallback rate (% of deliveries via Inbox + push vs. live WS) | Rising = connections failing or registry/presence wrong | Ticket on deviation |
+| | Receipt completion (% messages reaching DELIVERED within 1 min, online recipients) | Product-level proxy for end-to-end delivery health | Feeds SLO |
+| **Client / End-to-end** | Send → deliver latency p50/p99 (server accept → recipient ACK received) | The real NFR1 metric; measured server-side to avoid device clock skew | SLO |
+| | WebSocket connect success rate + time-to-connect (client-reported) | Gateway/TLS/auth failures never reach our servers' metrics | SLO burn rate |
+| | Reconnect rate per client per hour | Flaky networks, LB idle timeouts, bad deploys | Warn on 2× baseline |
+| | Inbox sync duration on reconnect p99 | First-screen UX after being offline | Ticket |
+
+#### SLIs & SLOs
+
+| SLI | Definition | SLO (28-day window) |
+|-----|-----------|---------------------|
+| **Delivery latency** | Server accept → recipient ACK, online recipients | p99 &lt; 500ms (NFR1) |
+| **Delivery completeness** | % of accepted messages with Inbox entries written for all participants within 60s | 99.999% (NFR3 — zero loss) |
+| **Send availability** | % of `SEND_MESSAGE` frames that get a server ack (not error/timeout) | 99.99% (NFR4) |
+| **Connect availability** | % of WebSocket connect attempts that succeed (client-measured) | 99.99% |
+| **Inbox sync latency** | `GET /v1/inbox` duration | p99 &lt; 300ms |
+
+#### Alerting
+
+- **Page on symptoms, via burn rate.** Multi-window burn-rate alerts on each SLO (fast burn, e.g. 14× over 1h confirmed by 5m → page; slow burn over 6h → page; 1× over 3 days → ticket). Users feel symptoms, not causes.
+- **Ticket on causes.** Compaction backlog, Redis memory at 75%, fd usage at 80% go to dashboards and tickets — **except** leading causes that become an outage within minutes (fd exhaustion, Inbox evictions, stuck Redis Stream, DLQ growth), which page directly.
+- Every page links a runbook and a per-hop dashboard, so the on-call goes from "delivery SLO burning" to "stream lag on server X" in one click.
+
+#### Tracing & Logs
+
+- **Propagate one trace context end to end.** Connection Service starts a trace (W3C `traceparent`) on `SEND_MESSAGE` and carries it in gRPC metadata → Kafka record headers → Redis Stream entry fields → recipient `NEW_MESSAGE` delivery → `ACK`. `messageId` is logged at every hop as the correlation key.
+- **Fan-out uses span links**, not one giant trace — a 200-member group produces ~30 per-server deliveries linked to the parent send span.
+- **Sample.** Head-sample ~0.1% (~2K traces/sec at peak) plus **tail-based sampling** that keeps 100% of traces that are slow (> 500ms) or errored, and force-sampling for flagged test/debug accounts.
+- **Structured logs, metadata only.** Log messageId, chatId, frame type, size, latency, serverId, status. Sample success logs; keep all errors.
+
+:::info E2E encryption and telemetry
+Never log, trace, or attach as a span attribute any message content, media encryption keys, or push preview blobs — even though they're ciphertext, they don't belong in a telemetry pipeline with broader access. Metadata (who messaged whom, when) is itself sensitive: pseudonymize user IDs in long-retention logs and enforce short retention.
+:::
+
+#### Metric Cardinality
+
+**Approach A: Per-user / per-chat labeled metrics**
+- Label delivery latency, ACK timeouts, and Inbox depth with `userId` / `chatId`
+- Pros: directly answers "is user X affected?"; trivial hot-chat detection
+- Cons: 500M users × ~10 metrics × ~15 histogram buckets ≈ tens of billions of series — no TSDB survives that; slow queries, huge cost, and user identifiers leak into the metrics store
+
+**Approach B: Bounded-label metrics + exemplars + sampled traces/logs**
+- Metrics carry only bounded labels: region, pod, serverId (~235), Kafka partition (200), frame type, status
+- Latency histograms attach **exemplars** (trace IDs) so a p99 spike links straight to a slow trace
+- Per-user/per-message questions are answered from tail-sampled traces and structured logs queried by messageId/userId; hot chats come from a bounded top-K (heavy-hitters sketch) emitted by the Fan-out Worker
+- Pros: bounded, predictable series count; cheap; PII stays out of metrics
+- Cons: a given user's latency can't be graphed; per-user answers depend on sampling and log retention
+
+**Decision: Approach B.** Rule: no metric label with unbounded values; serverId and partition are allowed because they're bounded and map to the unit an operator can act on (drain a pod, rebalance a partition).
+
+:::staff[Cardinality: metrics say "is it broken", traces and logs say "who is affected"]
+We chose bounded-label metrics plus exemplars and tail-sampled traces over per-user/per-chat labels. We give up graphing any single user's or chat's latency — support escalations are resolved by looking up the messageId in logs/traces instead. Revisit if "my messages aren't delivering" escalations regularly can't be resolved from sampled data: then ship per-message delivery events to a columnar event store (ClickHouse/Pinot-style) built for high-cardinality queries — never by adding userId labels to the TSDB.
+:::
+
 ---
 
 ## 6. Bottlenecks & Failure Scenarios
@@ -736,7 +836,9 @@ graph LR
 
 **Problem:** Connection Service pod restarts → 640K users reconnect simultaneously → spike in Inbox sync + connection registry writes.
 
-Autoscaling reacts in minutes — too slow for a spike that happens in seconds.
+:::staff[The thundering herd is usually self-inflicted]
+Autoscaling reacts in minutes — too slow for a spike that happens in seconds. The most frequent mass reconnect is our own deploy, so the fix lives in the client (jitter + backoff) and the rollout process, not in capacity. Size the blast radius per pod (~640K reconnects) and verify Inbox sync and the Registry can absorb exactly one pod's worth at a time.
+:::
 
 | Mitigation | How |
 |------------|-----|
@@ -756,7 +858,9 @@ Autoscaling reacts in minutes — too slow for a spike that happens in seconds.
 | **Batched Inbox writes** | Fan-out Worker batches multiple messages for the same chat before writing. Instead of 500 writes × 100 msgs = 50K writes, batch into 500 writes containing 100 messages each. |
 | **Switch to [read-time fan-out](/patterns/fan-out)** | Detect when a chat exceeds threshold (e.g., > 50 msgs/min) → stop writing per-user Inbox entries → store in per-chat stream instead → members pull from the stream. This is the Discord channel model. |
 
-Decision: **Rate-limit + batched writes** for simplicity. Switch to read-time fan-out only if hot chats become a sustained pattern.
+:::staff[Write-time fan-out economics]
+Decision: **Rate-limit + batched writes** for simplicity. Write-time fan-out pays O(group size) writes per message to make every read O(1) — the right trade with ~20-member groups and a 5:1 read:write ratio. A hot 500-member chat inverts those economics, so it's the signal to flip **that chat** (not the whole system) to read-time fan-out. Switch to read-time fan-out only if hot chats become a sustained pattern — e.g., a meaningful share of fan-out writes come from chats above the threshold.
+:::
 
 ### 6.3 Cascading Failure
 
@@ -787,7 +891,9 @@ Fan-out Worker → Redis (slow)
   └── Inbox pressure can't starve routing
 ```
 
-**Key principle:** Kafka is the shock absorber. Circuit breakers are the fuses. No single slow service can cascade to the full system.
+:::staff[Absorb pressure at boundaries, shed the cheapest work first]
+**Key principle:** Kafka is the shock absorber. Circuit breakers are the fuses. No single slow service can cascade to the full system. Under stress the priority order is explicit: real-time delivery > Inbox durability > push notifications — load shedding drops the work that is cheapest to lose (a late push) first. The Redis bulkhead exists because Inbox and Connection Registry share infrastructure but not criticality.
+:::
 
 ### 6.4 Multi-Region Failure
 
@@ -808,7 +914,9 @@ Fan-out Worker → Redis (slow)
 | **Active-passive** (recommended) | Simple. One region serves traffic, other is warm standby. | Failover delay (~60s). Standby region costs money while idle. |
 | **Active-active** | Both regions serve traffic. Lower latency for geographically distributed users. | Massive complexity: message ordering across regions, conflict resolution for concurrent writes to same chat, split-brain during partition. |
 
-**Decision: Active-passive.** Active-active adds enormous complexity (cross-region message ordering, conflict resolution) for a marginal latency improvement. Chat can tolerate ~60s failover — users see "connecting..." and retry.
+:::staff[Active-passive: buying simplicity with a ~60s RTO]
+**Decision: Active-passive.** Active-active adds enormous complexity (cross-region message ordering, conflict resolution) for a marginal latency improvement. Chat can tolerate ~60s failover — users see "connecting..." and retry. Redis state is deliberately not replicated cross-region: it's rebuildable from Cassandra, so failover costs a slower first sync, not lost messages. Revisit when per-region *latency* (not availability) becomes the complaint — and then home each chat to a region first, so ordering never spans regions.
+:::
 
 ### 6.5 Component Failure Summary
 
@@ -836,6 +944,7 @@ Fan-out Worker → Redis (slow)
 | Message store | Cassandra | PostgreSQL / DynamoDB | Eventual consistency for massive write throughput; single-partition reads by chatId |
 | Inbox / MessageStatus | Redis | Cassandra | Memory-bound for clean deletes without tombstones; Cassandra as durability backstop |
 | User/Chat metadata | PostgreSQL + Redis cache | Full NoSQL | Relational joins and strong consistency for small, stable datasets |
+| Observability cardinality | Bounded-label metrics + exemplars + tail-sampled traces | Per-user / per-chat metric labels | Can't graph a single user's latency; per-user debugging relies on traces/logs by messageId |
 
 ## 8. Related Concepts
 
@@ -863,6 +972,7 @@ Fan-out Worker → Redis (slow)
 - [Bulkhead](/patterns/bulkhead) — resource isolation to contain failures
 - [Idempotency](/patterns/idempotency) — safe retries under at-least-once delivery
 - [Presence & Heartbeat](/patterns/presence-heartbeat) — online/last-seen tracking at scale
+- [Observability](/foundations/observability) — metric layers (USE/RED), SLIs/SLOs, burn-rate alerting, tracing, cardinality control
 
 ## Appendix: Scale Assumptions
 

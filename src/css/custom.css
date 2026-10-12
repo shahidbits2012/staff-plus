@@ -58,3 +58,18 @@ table th {
 .mermaid {
   text-align: center;
 }
+
+/* :::staff — Staff+ Insight callout */
+.admonition-staff {
+  --ifm-alert-background-color: #f5f3ff;
+  --ifm-alert-background-color-highlight: rgba(124, 58, 237, 0.15);
+  --ifm-alert-foreground-color: #3b0764;
+  --ifm-alert-border-color: #7c3aed;
+}
+
+[data-theme='dark'] .admonition-staff {
+  --ifm-alert-background-color: #2e1065;
+  --ifm-alert-background-color-highlight: rgba(167, 139, 250, 0.2);
+  --ifm-alert-foreground-color: #ede9fe;
+  --ifm-alert-border-color: #a78bfa;
+}

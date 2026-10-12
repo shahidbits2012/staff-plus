@@ -6,6 +6,13 @@
       "problem": "/problems/messaging/chat-system",
       "format": "vetora-yaml",
       "file": "/designs/chat-system.vetora.yaml"
+    },
+    {
+      "id": "rate-limiter",
+      "title": "Distributed Rate Limiter",
+      "problem": "/problems/real-time/rate-limiter",
+      "format": "vetora-yaml",
+      "file": "/designs/rate-limiter.vetora.yaml"
     }
   ]
 }

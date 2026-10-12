@@ -1,0 +1,479 @@
+system_name: "Distributed Rate Limiter"
+description: >
+  API-gateway-embedded rate limiter with hybrid counters (final architecture,
+  §5.5). One region is drawn; the other regions run an identical stack and are
+  joined through the cross-region counter-delta topic. Hot path: every request
+  is evaluated in-process against a local rule cache and local counters (~0.12ms)
+  and either forwarded upstream or rejected with 429 + Retry-After /
+  X-RateLimit-* headers. Background: gateway pods flush counter deltas to the
+  Sync Service every 500ms, which INCRBYs them into the Redis Cluster and
+  publishes the region's deltas for the other regions (2s, ~10% bounded
+  overshoot). Cold path: admins manage rules through the Rule Service
+  (PostgreSQL), which refreshes the Redis rule cache and publishes
+  `rules:changed` so every gateway invalidates within ~1-2s (60s TTL safety net).
+  Fail-open: if Redis is unreachable a circuit breaker (3 timeouts) drops the
+  gateways to local-only counters rather than blocking traffic.
+entry_points:
+  - client
+  - admin_client
+
+components:
+  # ---------------- Callers ----------------
+  client:
+    type: Client
+    position: { x: 40, y: 220 }
+
+  admin_client:
+    type: Client
+    position: { x: 40, y: 400 }
+
+  # ---------------- Edge ----------------
+  # ~50 gateway pods per region. rate_limit_rps is only a coarse global flood
+  # ceiling; per-identity limits are enforced by the limiter plugin below.
+  api_gateway:
+    type: ApiGateway
+    position: { x: 400, y: 220 }
+    auth_enabled: true
+    auth_latency_ms: 3
+    auth_failure_rate: 0.005
+    max_concurrent_requests: 100000
+    rate_limit_rps: 1000000
+
+  # The limiter is a plugin INSIDE the gateway process (§4 placement decision);
+  # it is drawn as its own node because ApiGateway exposes no per-key limiter
+  # params. The page's rule is 1000 req / 60s per identity (sliding window
+  # counter). The format exposes no window-length param (the engine default
+  # is a 1s window), so capacity is the same rule expressed per second
+  # (1000 / 60 ≈ 17). key_field client_id is the simulator's per-caller
+  # identity and stands in for api_key.
+  rate_limiter:
+    type: RateLimiter
+    position: { x: 760, y: 220 }
+    algorithm: sliding_window
+    capacity: 17
+    key_field: client_id
+
+  # ---------------- Services ----------------
+  # Example protected backend: the page's /v1/check uses resource
+  # /api/v1/orders. It sits outside the limiter's scope but must exist so the
+  # hot-path edges resolve to a real endpoint (CL-014).
+  # Capacity ≈ 200 × 4 / 2ms × 1000 = 400K rps (~333K/region at 1M global).
+  orders_api:
+    type: Service
+    position: { x: 1120, y: 220 }
+    pods: 200
+    threads_per_pod: 100
+    cpu_cores: 4
+    processing_time_ms: 2
+    total_response_time_ms: 10
+    queue_limit: 4000
+    endpoints:
+      - id: ep_get_orders
+        method: GET
+        path: /api/v1/orders
+        summary: "Protected upstream API (example resource)"
+        description: "Reached only after the gateway limiter admits the request. Throttled callers never get here: they receive 429 with Retry-After and X-RateLimit-Limit/Remaining/Reset headers from the gateway."
+        requestBody:
+          - { name: apiKey, field_type: string, required: true, description: "Caller identity used as the rate-limit key" }
+          - { name: cursor, field_type: string, required: false, description: "Pagination cursor" }
+
+  # One per region. Redis sees ~100 ops/s per hot key (50 pods × 2 flushes/s)
+  # instead of one write per request, which is why hot keys need no sharding.
+  sync_service:
+    type: Service
+    position: { x: 760, y: 400 }
+    pods: 3
+    threads_per_pod: 50
+    cpu_cores: 2
+    processing_time_ms: 2
+    total_response_time_ms: 8
+    queue_limit: 1000
+    endpoints:
+      - id: ep_sync_counters
+        method: POST
+        path: /internal/v1/counters/sync
+        summary: "Flush a gateway pod's counter deltas (every 500ms)"
+        description: "Batched INCRBY of accumulated local deltas into Redis via a Lua script (atomic), returns global counts so the pod can correct its local counters, and publishes the region's deltas for cross-region merge. Sync intervals are jittered across pods so they don't all flush together."
+        requestBody:
+          - { name: podId, field_type: string, required: true, description: "Gateway pod id" }
+          - { name: windowId, field_type: number, required: true, description: "floor(now / windowSeconds)" }
+          - { name: deltas, field_type: string, required: true, description: "Map of counter key -> delta since last flush" }
+
+  # Low traffic (rules change ~1-10×/day); 2-3 pods suffice.
+  rule_service:
+    type: Service
+    position: { x: 760, y: 580 }
+    pods: 3
+    threads_per_pod: 50
+    cpu_cores: 2
+    processing_time_ms: 5
+    total_response_time_ms: 20
+    queue_limit: 500
+    endpoints:
+      - id: ep_create_rule
+        method: POST
+        path: /v1/rules
+        summary: "Create a rate-limit rule"
+        description: "Admin-only. Persists the rule to PostgreSQL, writes it to the Redis rule cache and publishes rules:changed so gateways pick it up within ~1-2s."
+        requestBody:
+          - { name: identityType, field_type: string, required: true, description: "ip | api_key | client_key | service" }
+          - { name: limit, field_type: number, required: true, description: "Max requests per window" }
+          - { name: windowSeconds, field_type: number, required: true, description: "Window duration in seconds" }
+          - { name: algorithm, field_type: string, required: true, description: "fixed_window | sliding_window | token_bucket" }
+          - { name: action, field_type: string, required: true, description: "reject | throttle" }
+      - id: ep_update_rule
+        method: PUT
+        path: /v1/rules/{ruleId}
+        summary: "Update a rate-limit rule"
+        description: "Admin-only. Bumps the rule version and invalidates it everywhere. Gateways may enforce the stale rule for at most 60s (TTL safety net) if a pub/sub message is missed."
+        requestBody:
+          - { name: ruleId, field_type: string, required: true, description: "Target rule id" }
+          - { name: limit, field_type: number, required: false, description: "New limit" }
+          - { name: windowSeconds, field_type: number, required: false, description: "New window" }
+          - { name: algorithm, field_type: string, required: false, description: "New algorithm" }
+          - { name: action, field_type: string, required: false, description: "New action" }
+      - id: ep_get_rules
+        method: GET
+        path: /v1/rules
+        summary: "List rules (admin view + gateway cold start)"
+        description: "Returns all active rules. Besides the admin UI, gateway pods call this at startup to populate their local rule cache before the readiness probe passes."
+        requestBody:
+          - { name: identityType, field_type: string, required: false, description: "Optional filter" }
+      - id: ep_delete_rule
+        method: DELETE
+        path: /v1/rules/{ruleId}
+        summary: "Delete a rate-limit rule"
+        description: "Admin-only. Removes the rule and publishes rules:changed. Existing counters for it simply expire with their window TTL."
+        requestBody:
+          - { name: ruleId, field_type: string, required: true, description: "Target rule id" }
+
+  # ---------------- Data stores ----------------
+  # Durable rules only: low write volume, relational, auditable. Primary +
+  # read replica.
+  postgres:
+    type: Database
+    position: { x: 760, y: 760 }
+    max_connections: 50
+    read_latency_ms: 5
+    write_latency_ms: 10
+    replicas: 2
+    queue_limit: 1000
+    read_latency_slo_ms: 30
+    write_latency_slo_ms: 100
+    tables:
+      - id: tbl_rules
+        name: rules
+        primaryKey: id
+        columns:
+          - { name: id, field_type: string, required: true, description: "Rule id (UUID, PK)" }
+          - { name: name, field_type: string, required: true, description: "Human-readable label" }
+          - { name: identity_type, field_type: string, required: true, description: "ip | api_key | client_key | service" }
+          - { name: limit, field_type: number, required: true, description: "Max requests per window" }
+          - { name: window_seconds, field_type: number, required: true, description: "Window duration" }
+          - { name: algorithm, field_type: string, required: true, description: "fixed_window | sliding_window | token_bucket" }
+          - { name: action, field_type: string, required: true, description: "reject | throttle" }
+          - { name: created_at, field_type: string, required: true, description: "Creation timestamp" }
+          - { name: updated_at, field_type: string, required: true, description: "Last modification timestamp" }
+
+  # Redis Cluster: 3 primaries + 3 replicas. Counter working set ≈ 100M keys ×
+  # 128B ≈ 12.8 GB (~4.3 GB/shard). Sized above the working set on purpose:
+  # an evicted counter silently resets a client's quota.
+  redis:
+    type: Cache
+    position: { x: 1120, y: 580 }
+    cache_size_mb: 19200
+    working_set_mb: 12800
+    access_pattern: zipfian
+    latency_hit_ms: 1
+    read_latency_slo_ms: 5
+    write_latency_slo_ms: 10
+    cacheSpaces:
+      - id: cs_counters
+        name: "Global Counters"
+        keyPattern: "rl:{ruleId}:{identityValue}:{windowId}"
+        defaultTtlSeconds: 60
+        valueFields:
+          - { name: count, field_type: number, required: true, description: "Requests in this window (TTL = windowSeconds, self-cleaning)" }
+      - id: cs_remote_counts
+        name: "Remote Region Counts"
+        keyPattern: "rl:remote:{region}:{ruleId}:{identityValue}:{windowId}"
+        defaultTtlSeconds: 60
+        valueFields:
+          - { name: count, field_type: number, required: true, description: "Latest count reported by the remote region" }
+          - { name: syncedAt, field_type: number, required: true, description: "Epoch ms of the remote snapshot" }
+      - id: cs_rule_cache
+        name: "Rule Cache"
+        keyPattern: "rule:{identityType}:{resource}"
+        defaultTtlSeconds: 60
+        valueFields:
+          - { name: ruleId, field_type: string, required: true, description: "Rule id" }
+          - { name: limit, field_type: number, required: true, description: "Max requests per window" }
+          - { name: windowSeconds, field_type: number, required: true, description: "Window duration" }
+          - { name: algorithm, field_type: string, required: true, description: "Algorithm" }
+          - { name: action, field_type: string, required: true, description: "reject | throttle" }
+          - { name: version, field_type: number, required: true, description: "Bumped on every change; stale versions are ignored" }
+
+  # Cross-region delta log. Each region publishes here; the topic is
+  # replicated to the other regions (MirrorMaker-style) and consumed locally.
+  kafka:
+    type: EventStream
+    position: { x: 1120, y: 400 }
+    throughput_limit_per_sec: 0
+    publish_latency_ms: 3
+    queue_limit: 1000000
+    partitions: 32
+    topics:
+      - id: topic_counter_deltas
+        name: "rl-counter-deltas"
+        partitionKey: counterKey
+        schema:
+          - { name: region, field_type: string, required: true, description: "Originating region (us-east | us-west | eu)" }
+          - { name: counterKey, field_type: string, required: true, description: "rl:{ruleId}:{identityValue}:{windowId} (partition key)" }
+          - { name: count, field_type: number, required: true, description: "Region's current count for the window" }
+          - { name: windowId, field_type: number, required: true, description: "floor(now / windowSeconds)" }
+
+  # ---------------- Async consumers ----------------
+  # Pull side of the Sync Service: merges other regions' counts so gateways
+  # compute effective_count = local_count + sum(remote_counts).
+  region_merge_worker:
+    type: Worker
+    position: { x: 1480, y: 400 }
+    workers: 3
+    processing_time_ms: 5
+    cpu_cores: 2
+    queue_limit: 10000
+
+edges:
+  # ===== Entry =====
+  # Contract-less hops (ApiGateway / RateLimiter) bind to the endpoint on the
+  # Service they ultimately reach (spec §4.1).
+  - source: client
+    target: api_gateway
+    edge_type: API_CALL
+    contract_id: ep_get_orders
+    label: "Every request"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 15
+
+  - source: admin_client
+    target: api_gateway
+    edge_type: API_CALL
+    contract_id: ep_create_rule
+    label: "Admin rule CRUD"
+    source_handle: source-right-1
+    target_handle: target-left-2
+    latency_ms: 15
+
+  # ===== Hot path =====
+  # In-process plugin call, so near-zero hop latency (latency budget: ~0.12ms total).
+  - source: api_gateway
+    target: rate_limiter
+    edge_type: API_CALL
+    contract_id: ep_get_orders
+    label: "Local counter check"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 0.1
+
+  # RateLimiter forwards admitted traffic to its FIRST downstream only, so
+  # this must stay its sole outgoing edge. Rejected requests return 429.
+  - source: rate_limiter
+    target: orders_api
+    edge_type: API_CALL
+    contract_id: ep_get_orders
+    label: "Allow (else 429)"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  # ===== Background counter sync =====
+  - source: api_gateway
+    target: sync_service
+    edge_type: API_CALL
+    contract_id: ep_sync_counters
+    label: "Flush deltas (500ms)"
+    source_handle: source-bottom-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: sync_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_counters
+    operation: SET
+    label: "Lua INCRBY batch"
+    source_handle: source-bottom-2
+    target_handle: target-top-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_sync_incrby
+        source_contract_id: ep_sync_counters
+        label: "POST /internal/v1/counters/sync"
+        field_mappings: []
+
+  - source: sync_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_remote_counts
+    operation: GET
+    label: "Read remote counts"
+    source_handle: source-bottom-3
+    target_handle: target-top-2
+    latency_ms: 2
+    input_bindings:
+      - id: ib_sync_remote_read
+        source_contract_id: ep_sync_counters
+        label: "Return global state to pod"
+        field_mappings: []
+
+  - source: sync_service
+    target: kafka
+    edge_type: KAFKA_EVENT
+    contract_id: topic_counter_deltas
+    label: "Publish region deltas"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_sync_publish
+        source_contract_id: ep_sync_counters
+        label: "Emit rl-counter-deltas"
+        field_mappings: []
+
+  # Remote regions' deltas arrive over cross-region replication (~70-150ms),
+  # which is fine because this path is fully async.
+  - source: kafka
+    target: region_merge_worker
+    edge_type: KAFKA_EVENT
+    contract_id: topic_counter_deltas
+    label: "Consume remote deltas (2s)"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 100
+    input_bindings:
+      - id: ib_consume_deltas
+        source_contract_id: topic_counter_deltas
+        label: "rl-counter-deltas"
+        field_mappings: []
+
+  - source: region_merge_worker
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_remote_counts
+    operation: SET
+    label: "Merge remote counts"
+    source_handle: source-bottom-2
+    target_handle: target-right-1
+    latency_ms: 2
+
+  # ===== Cold path: rules =====
+  - source: api_gateway
+    target: rule_service
+    edge_type: API_CALL
+    contract_id: ep_create_rule
+    label: "Admin routes"
+    source_handle: source-bottom-2
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: api_gateway
+    target: rule_service
+    edge_type: API_CALL
+    contract_id: ep_get_rules
+    label: "Cold-start rule load"
+    source_handle: source-bottom-3
+    target_handle: target-left-2
+    latency_ms: 3
+
+  - source: rule_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_rules
+    operation: INSERT
+    label: "Insert rule"
+    source_handle: source-bottom-1
+    target_handle: target-top-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_rule_insert
+        source_contract_id: ep_create_rule
+        label: "POST /v1/rules"
+        field_mappings: []
+
+  - source: rule_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_rules
+    operation: UPDATE
+    label: "Update rule"
+    source_handle: source-bottom-2
+    target_handle: target-top-2
+    latency_ms: 3
+    input_bindings:
+      - id: ib_rule_update
+        source_contract_id: ep_update_rule
+        label: "PUT /v1/rules/{ruleId}"
+        field_mappings: []
+
+  - source: rule_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_rules
+    operation: DELETE
+    label: "Delete rule"
+    source_handle: source-bottom-3
+    target_handle: target-top-3
+    latency_ms: 3
+    input_bindings:
+      - id: ib_rule_delete
+        source_contract_id: ep_delete_rule
+        label: "DELETE /v1/rules/{ruleId}"
+        field_mappings: []
+
+  - source: rule_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_rules
+    operation: SELECT
+    label: "Load all rules"
+    source_handle: source-left-2
+    target_handle: target-left-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_rule_select
+        source_contract_id: ep_get_rules
+        label: "GET /v1/rules"
+        field_mappings: []
+
+  - source: rule_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_rule_cache
+    operation: SET
+    label: "Refresh rule cache"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_rule_cache_set
+        source_contract_id: ep_update_rule
+        label: "Write new rule version"
+        field_mappings: []
+
+  # Pub/sub invalidation: gateways subscribed to rules:changed drop their
+  # local entry. Chosen over polling because rules change ~1-10×/day.
+  - source: rule_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_rule_cache
+    operation: INVALIDATE
+    label: "Publish rules:changed"
+    source_handle: source-right-2
+    target_handle: target-left-2
+    latency_ms: 2
+    input_bindings:
+      - id: ib_rule_invalidate
+        source_contract_id: ep_update_rule
+        label: "Invalidate gateway caches"
+        field_mappings: []
