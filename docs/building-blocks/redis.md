@@ -247,6 +247,184 @@ Key: "{userId}:inbox"  and  "{userId}:status"
 | Memory-bound — all data in RAM | Cost and capacity limits | Monitor memory; use eviction + TTL; tier cold data to disk |
 | Max ~1000 nodes (16384 slots) | Upper bound on cluster size | Sufficient for most use cases; beyond this, consider client-side partitioning |
 
+## Pub/Sub
+
+Redis has two Pub/Sub systems. Understanding the internals of each is critical for real-time system design because the failure modes are **silent** — subscribers are disconnected without an error on the publish side.
+
+### Classic Pub/Sub (`PUBLISH` / `SUBSCRIBE`)
+
+```
+SUBSCRIBE comments:stream-123          // client subscribes
+PUBLISH comments:stream-123 "hello"    // another client publishes → all subscribers receive
+```
+
+#### Internal data structures
+
+Redis maintains two dicts on the server:
+
+```
+server.pubsub_channels:   channel_name → linked list of client pointers
+server.pubsub_patterns:   pattern → linked list of client pointers (PSUBSCRIBE "comments:*")
+```
+
+`SUBSCRIBE` adds the client to the linked list. No messages are stored — Pub/Sub is **fire-and-forget**.
+
+#### What happens on PUBLISH (single-threaded, synchronous)
+
+1. Look up the channel in `pubsub_channels` dict → O(1)
+2. **Iterate the subscriber linked list** → for each subscriber:
+   - Copy the message into that client's **output buffer**
+   - If the buffer exceeds `client-output-buffer-limit pubsub`, **disconnect the client immediately**
+3. Check all registered patterns (`PSUBSCRIBE`) for matches → O(P) where P = total patterns
+4. Return the number of subscribers that received the message
+
+Step 2 is **O(N)** where N = subscribers for that channel. It runs on the main thread. While Redis is iterating 1000 subscribers and copying 200 bytes into each buffer, **no other command executes** — no XADD, no GET, nothing.
+
+After the message is in each client's output buffer, the **event loop** handles the actual TCP sends asynchronously (or via I/O threads in Redis 6+). The network send doesn't block, but the buffer copy does.
+
+#### Cluster behavior — the broadcast problem
+
+In Redis Cluster, `PUBLISH` broadcasts the message over the **cluster bus to every node**, regardless of whether that node has subscribers:
+
+```mermaid
+graph LR
+    PUB[Publisher] -->|PUBLISH| N1[Node 1<br/>2 subscribers]
+    N1 -->|cluster bus| N2[Node 2<br/>0 subscribers]
+    N1 -->|cluster bus| N3[Node 3<br/>1 subscriber]
+    N1 -->|cluster bus| N4[Node 4<br/>0 subscribers]
+```
+
+Every node receives every message, even nodes with zero subscribers for that channel. At 100K active channels with 10K total publishes/sec, the cluster bus carries all 10K messages to all nodes. **Adding nodes makes it worse.**
+
+### Sharded Pub/Sub (`SPUBLISH` / `SSUBSCRIBE`, Redis 7+)
+
+Sharded Pub/Sub ties each channel to a **hash slot**, just like data keys:
+
+```
+SSUBSCRIBE comments:stream-123         // client connects to the node owning this slot
+SPUBLISH comments:stream-123 "hello"   // delivered only to subscribers on that node
+```
+
+```
+slot = CRC16("comments:stream-123") % 16384
+```
+
+#### Key differences from Classic
+
+| | Classic Pub/Sub | Sharded Pub/Sub |
+|---|---|---|
+| Cluster routing | Broadcasts to **all nodes** via cluster bus | Stays on the **single node** owning the channel's slot |
+| Where subscribers connect | Any node | Must connect to the node owning the slot (client follows `MOVED` redirects) |
+| Cross-node cost per PUBLISH | O(cluster_size) | O(1) |
+| Pattern subscribe (`PSUBSCRIBE`) | ✅ supported | ❌ not supported |
+| Slot migration | N/A | Channel moves with its slot during resharding; subscribers must re-subscribe |
+| Scaling ceiling | Adding nodes makes it worse | Adding nodes helps — channels spread across shards |
+
+#### Hash tag interaction
+
+Redis hashes only the content between `{...}` in a key. This is a common trap with Sharded Pub/Sub:
+
+```
+Channel: comments:{stream-123}:shard-0
+Channel: comments:{stream-123}:shard-1
+Channel: comments:{stream-123}:shard-7
+```
+
+All 8 "sharded" channels hash only `stream-123` → **same slot → same node**. The sharding achieves nothing.
+
+**Fix:** put the shard number inside the braces:
+
+```
+Channel: comments:{stream-123:0}    → different slot
+Channel: comments:{stream-123:1}    → different slot
+Channel: comments:{stream-123:7}    → different slot
+```
+
+Or drop hash tags entirely and let the full channel name hash naturally.
+
+### Scaling Analysis: Subscribers × Messages
+
+The core scalability constraint is the **O(N) buffer copy per PUBLISH**, running on the single-threaded main loop.
+
+| Subscribers | Message size | Time per PUBLISH | At 10K PUBLISH/sec | Feasible? |
+|------------|-------------|------------------|-------------------|-----------|
+| 10 | 200 bytes | ~0.01ms | 100ms/sec (10% CPU) | ✅ Comfortable |
+| 100 | 200 bytes | ~0.05ms | 500ms/sec (50% CPU) | ⚠️ Tight |
+| 1,000 | 200 bytes | ~0.5ms | 5 sec/sec | ❌ Impossible |
+| 10 | 2 KB | ~0.05ms | 500ms/sec | ⚠️ Tight |
+
+**Rule of thumb:** a single Redis node can handle about **subscribers × publishes/sec ≤ 1-2M deliveries/sec** for small messages, bounded by main-thread CPU and NIC bandwidth.
+
+**Network bound:** 1000 subscribers × 200 bytes × 10K/sec = 2 GB/sec outbound. A 10Gbps NIC caps at ~1.25 GB/sec. The node hits the network ceiling before the CPU ceiling.
+
+### The `client-output-buffer-limit` Trap
+
+```
+client-output-buffer-limit pubsub 32mb 8mb 60
+```
+
+This means: disconnect a Pub/Sub subscriber if its output buffer exceeds 32MB (hard limit), or stays above 8MB for 60 seconds (soft limit).
+
+**Why this exists:** if a subscriber is slow (GC pause, network congestion), its output buffer grows unboundedly, consuming Redis memory that could cause an OOM.
+
+**Why it's dangerous:**
+
+| Scenario | Buffer growth | What happens |
+|----------|-------------|--------------|
+| Gateway GC pause (4 seconds) at 2 MB/sec inflow | 8 MB | Soft timer starts. If GC happens again within 60s → disconnect |
+| Network blip (16 seconds) | 32 MB | **Immediate disconnect** — no warning, no retry |
+| Slow consumer under sustained load | Gradual growth | Disconnect when hard limit is hit |
+
+The disconnect is **silent on the publish side**. The publisher gets no error. The subscriber's connection is closed by Redis. The subscriber must detect the broken connection, reconnect, and re-subscribe. During that window, all messages are lost.
+
+Redis logs: `Client id=X addr=Y:Z ... scheduled to be closed ASAP for overcoming of output buffer limits`
+
+**Mitigations:**
+
+| Mitigation | How |
+|------------|-----|
+| **Increase buffer limits** for production | `client-output-buffer-limit pubsub 256mb 64mb 120` — gives more headroom for bursts |
+| **Monitor output buffer length** | `INFO CLIENTS` → `client_recent_max_output_buffer`; alert before limits are hit |
+| **Alert on Pub/Sub disconnections** | Parse Redis logs or track subscriber count per channel |
+| **Safety-net polling** | Background `XREAD` on Redis Streams to detect and fill gaps when Pub/Sub messages are missed |
+| **Reduce subscriber count per channel** | Use relay subscribers (see below) to reduce from 1000 to 10 per channel |
+
+### Scaling Pattern: Relay Subscribers
+
+When a channel has too many subscribers for one node (>100), use relay processes to create a **fan-out tree**:
+
+```mermaid
+graph TD
+    PUB[Publisher] -->|"SPUBLISH (10K/sec)"| RS["Redis Node<br/>10 relay subscribers"]
+    RS --> R1[Relay 1]
+    RS --> R2[Relay 2]
+    RS --> R10[Relay 10]
+    R1 -->|"gRPC stream"| G1["100 consumers"]
+    R2 -->|"gRPC stream"| G2["100 consumers"]
+    R10 -->|"gRPC stream"| G3["100 consumers"]
+```
+
+| | Direct (1000 subscribers) | Relay (10 subscribers) |
+|---|---|---|
+| Buffer copies per PUBLISH | 1000 | **10** |
+| Main-thread time per PUBLISH | ~0.5ms | **~0.01ms** |
+| At 10K PUBLISH/sec | 5 sec/sec ❌ | **100ms/sec** ✅ |
+| NIC outbound | 2 GB/sec ❌ | **20 MB/sec** ✅ |
+
+Each relay fans out to ~100 consumers via gRPC streaming or a secondary Pub/Sub. This is the pattern behind **Facebook's Wormhole** (live video comment delivery) and **YouTube Live** (hierarchical pub/sub).
+
+**Trade-off:** adds 1-2ms latency per relay hop. The relay is a new process to monitor and fail over. If a relay dies, its 100 consumers lose feed until they reconnect to another relay.
+
+### When to use Classic vs Sharded vs neither
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Small cluster (&lt;6 nodes), few channels, few subscribers | Classic Pub/Sub — simplest, cluster bus cost is negligible |
+| Many channels (>1K), spread across cluster | **Sharded Pub/Sub** — prevents cluster bus flood |
+| One channel with >100 subscribers at high publish rate | Sharded Pub/Sub + relay subscribers |
+| One channel with >1000 subscribers | **Skip Pub/Sub** — use direct gRPC streaming from the publisher to relay/consumer tree |
+| Durable delivery needed (can't lose messages) | **Don't use Pub/Sub at all** — use Redis Streams with consumer groups |
+
 ## Eviction Policies
 
 When Redis hits the memory limit, it evicts keys based on the configured policy:
@@ -296,5 +474,5 @@ When Redis hits the memory limit, it evicts keys based on the configured policy:
 - [Cassandra](/building-blocks/cassandra) — when you need durable storage for massive write volumes
 - [SQL vs NoSQL](/decisions/sql-vs-nosql) — decision framework for database selection
 - [WebSocket Connection Management](/building-blocks/websocket-connection-management) — Redis as connection registry
-- [Sharding & Partitioning](/distributed-systems/sharding) — hash slots in the context of sharding approaches
+- [Sharding](/distributed-systems/sharding) — hash slots in the context of sharding approaches
 - [Consistent Hashing](/distributed-systems/consistent-hashing) — the alternative Redis chose not to use (and why)

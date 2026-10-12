@@ -135,7 +135,8 @@ With 150 vnodes per node, D's 150 points are scattered across the ring — it ab
 
 ## Related Concepts
 
-- [Sharding & Partitioning](/distributed-systems/sharding) — the broader context: why, how, and which approach to pick
+- [Sharding](/distributed-systems/sharding) — the broader context: why, how, and which approach to pick
+- [Partitioning](/distributed-systems/partitioning) — how a dataset is split (range, hash, list, composite) before it is placed on nodes
 - [Redis Cluster](/building-blocks/redis) — uses hash slots, not consistent hashing
 - [Cassandra](/building-blocks/cassandra) — uses consistent hashing with Murmur3 + vnodes
 - [Replication](/distributed-systems/replication) — how replicas are placed along the ring

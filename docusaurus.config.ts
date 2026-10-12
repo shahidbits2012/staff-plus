@@ -38,7 +38,17 @@ const config: Config = {
   markdown: {
     mermaid: true,
   },
-  themes: ['@docusaurus/theme-mermaid'],
+  themes: [
+    '@docusaurus/theme-mermaid',
+    ['@easyops-cn/docusaurus-search-local', {
+      hashed: true,
+      indexBlog: false,
+      docsRouteBasePath: '/',
+      highlightSearchTermsOnTargetPage: true,
+      searchResultLimits: 10,
+      searchBarShortcutHint: true,
+    }],
+  ],
 
   i18n: {
     defaultLocale: 'en',
@@ -52,6 +62,8 @@ const config: Config = {
         docs: {
           routeBasePath: '/',
           sidebarPath: './sidebars.ts',
+          // `:::staff` callout for Staff/Principal-level reasoning (see src/theme/Admonition/Types.tsx)
+          admonitions: {keywords: ['staff'], extendDefaults: true},
         },
         blog: false,
         theme: {

@@ -36,6 +36,24 @@ This duplicates logic, increases attack surface, and couples clients to internal
 | **Request/Response Transformation** | Adds headers, strips sensitive fields, compresses responses |
 | **Observability** | Centralized logging, metrics, distributed tracing injection |
 
+```mermaid
+graph LR
+    Client([Client]) --> TLS[TLS Termination]
+    TLS --> Auth[Authentication]
+    Auth --> RL[Rate Limiting]
+    RL --> Route[Routing]
+    Route --> Transform[Request Transform]
+    Transform --> Backend([Backend Service])
+
+    style Client fill:#e8f4fd,stroke:#2196f3
+    style TLS fill:#fff3e0,stroke:#ff9800
+    style Auth fill:#fff3e0,stroke:#ff9800
+    style RL fill:#fff3e0,stroke:#ff9800
+    style Route fill:#fff3e0,stroke:#ff9800
+    style Transform fill:#fff3e0,stroke:#ff9800
+    style Backend fill:#e8f5e9,stroke:#4caf50
+```
+
 ## L4 vs L7 Load Balancing
 
 ### L4 — Transport Layer (TCP/UDP)
@@ -58,6 +76,21 @@ Client → [L4 LB sees: src IP, dst IP, port] → Backend
 
 **Examples:** AWS NLB, HAProxy (TCP mode), Linux IPVS
 
+```mermaid
+graph LR
+    C([Client]) -->|TCP packet| L4[L4 Load Balancer]
+    L4 -->|Forwards raw TCP| B1([Backend A])
+    L4 -->|Forwards raw TCP| B2([Backend B])
+
+    L4 -.-|"Sees: src IP, dst IP, port"| Note[ ]
+
+    style C fill:#e8f4fd,stroke:#2196f3
+    style L4 fill:#fff3e0,stroke:#ff9800
+    style B1 fill:#e8f5e9,stroke:#4caf50
+    style B2 fill:#e8f5e9,stroke:#4caf50
+    style Note fill:none,stroke:none
+```
+
 ### L7 — Application Layer (HTTP/HTTPS)
 
 Operates at the HTTP level. Can inspect headers, paths, cookies, query parameters. Understands the application protocol.
@@ -79,6 +112,23 @@ Client → [L7 LB sees: path, headers, cookies, method] → Backend
 
 **Examples:** AWS ALB, Nginx, Envoy, Kong, Traefik
 
+```mermaid
+graph LR
+    C([Client]) -->|HTTP request| L7[L7 Load Balancer]
+    L7 -->|"/api/*"| API([REST Service])
+    L7 -->|"/ws/*"| WS([WebSocket Service])
+    L7 -->|"/static/*"| CDN([Static Assets])
+
+    L7 -.-|"Sees: path, headers, cookies, method"| Note[ ]
+
+    style C fill:#e8f4fd,stroke:#2196f3
+    style L7 fill:#fff3e0,stroke:#ff9800
+    style API fill:#e8f5e9,stroke:#4caf50
+    style WS fill:#e8f5e9,stroke:#4caf50
+    style CDN fill:#e8f5e9,stroke:#4caf50
+    style Note fill:none,stroke:none
+```
+
 ### Decision Guide
 
 | Scenario | Choose |
@@ -92,6 +142,28 @@ Client → [L7 LB sees: path, headers, cookies, method] → Backend
 | TLS passthrough to backend | L4 |
 
 **Common pattern:** L4 in front of L7. An NLB (L4) distributes TCP connections across multiple Nginx/Envoy (L7) instances. The L4 handles connection distribution; the L7 handles content-aware routing.
+
+```mermaid
+graph LR
+    C([Client]) --> NLB[NLB - L4]
+    NLB --> E1[Envoy 1 - L7]
+    NLB --> E2[Envoy 2 - L7]
+    NLB --> E3[Envoy 3 - L7]
+    E1 --> S1([Service Pool A])
+    E1 --> S2([Service Pool B])
+    E2 --> S1
+    E2 --> S2
+    E3 --> S1
+    E3 --> S2
+
+    style C fill:#e8f4fd,stroke:#2196f3
+    style NLB fill:#fce4ec,stroke:#e91e63
+    style E1 fill:#fff3e0,stroke:#ff9800
+    style E2 fill:#fff3e0,stroke:#ff9800
+    style E3 fill:#fff3e0,stroke:#ff9800
+    style S1 fill:#e8f5e9,stroke:#4caf50
+    style S2 fill:#e8f5e9,stroke:#4caf50
+```
 
 ## Authentication at the Gateway
 
@@ -108,6 +180,27 @@ Client → [L7 LB sees: path, headers, cookies, method] → Backend
 4. If valid → forwards request to backend with userId injected as a trusted header
 5. If invalid → returns 401, connection rejected
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AS as Auth Service
+    participant GW as API Gateway
+    participant BE as Backend
+
+    C->>AS: POST /login (credentials)
+    AS-->>C: 200 OK (JWT token)
+
+    C->>GW: GET /api/resource<br/>Authorization: Bearer JWT
+    GW->>GW: Validate JWT signature + expiry
+    GW->>BE: GET /api/resource<br/>X-User-Id: user123
+    BE-->>GW: 200 OK (response)
+    GW-->>C: 200 OK (response)
+
+    Note over C,GW: Invalid token scenario
+    C->>GW: GET /api/resource<br/>Authorization: Bearer EXPIRED
+    GW-->>C: 401 Unauthorized
+```
+
 ### WebSocket Authentication
 
 WebSocket connections start as an HTTP upgrade request. Auth happens **once at connection establishment**, not per message:
@@ -123,6 +216,27 @@ Authorization: Bearer <jwt-token>
 ```
 
 After the upgrade, the WebSocket connection is the authenticated session. No per-message auth overhead.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as API Gateway
+    participant WS as WebSocket Server
+
+    C->>GW: GET /ws (Upgrade: websocket)<br/>Authorization: Bearer JWT
+    GW->>GW: Validate JWT
+    GW->>WS: Forward upgrade request
+    WS-->>GW: 101 Switching Protocols
+    GW-->>C: 101 Switching Protocols
+
+    Note over C,WS: Connection is now authenticated
+
+    C->>WS: WS frame (message data)
+    WS-->>C: WS frame (response data)
+    C->>WS: WS frame (message data)
+
+    Note over C,WS: No per-message auth needed
+```
 
 **Token expiry during connection:** Gateway or backend can close the WebSocket when the JWT expires, forcing re-auth. Or use a refresh token mechanism over the WebSocket itself.
 
@@ -149,12 +263,39 @@ The gateway should NOT make authorization decisions. It only answers "is this a 
 
 **For WebSocket connections:** Least Connections is typically best — it ensures new connections go to the least-loaded server, which matters when connections are long-lived and each consumes memory.
 
+```mermaid
+graph TD
+    GW[API Gateway<br/>Least Connections] --> S1["Server 1<br/>42 active conns"]
+    GW --> S2["Server 2<br/>38 active conns"]
+    GW --> S3["Server 3<br/>45 active conns"]
+
+    New([New Connection]) -->|"Routes to least loaded"| GW
+
+    style New fill:#e8f4fd,stroke:#2196f3
+    style GW fill:#fff3e0,stroke:#ff9800
+    style S1 fill:#e8f5e9,stroke:#4caf50
+    style S2 fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px
+    style S3 fill:#e8f5e9,stroke:#4caf50
+```
+
 ## TLS Termination
 
 **TLS termination at the gateway** means the gateway handles the TLS handshake and decryption. Backend services receive plaintext HTTP.
 
 ```
 Client ──[HTTPS/TLS]──→ API Gateway ──[HTTP plaintext]──→ Backend
+```
+
+```mermaid
+graph LR
+    C([Client]) ==>|"HTTPS / TLS 1.3<br/>encrypted"| GW[API Gateway]
+    GW -->|"HTTP plaintext<br/>internal network"| B1([Backend A])
+    GW -->|"HTTP plaintext<br/>internal network"| B2([Backend B])
+
+    style C fill:#e8f4fd,stroke:#2196f3
+    style GW fill:#fff3e0,stroke:#ff9800
+    style B1 fill:#e8f5e9,stroke:#4caf50
+    style B2 fill:#e8f5e9,stroke:#4caf50
 ```
 
 | Pros | Cons |
