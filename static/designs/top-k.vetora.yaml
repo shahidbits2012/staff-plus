@@ -1,0 +1,416 @@
+system_name: "Top-K Heavy Hitters"
+description: >
+  Final two-layer architecture for top-K queries at roughly 800K events/second.
+  Upstream producers batch view events into Kafka through their producer adapter;
+  Flink maintains exact windowed counts, a sliding one-hour result, and an
+  approximate CMS-based live result. PostgreSQL stores canonical hourly and
+  rollup counts. A scheduled precompute service reads indexed aggregates and
+  refreshes Redis sorted sets, while the query service serves only the small
+  precomputed result with PostgreSQL as a degraded fallback. The producer
+  adapter and cron scheduler are modeled as Service and Client nodes because
+  Vetora has no direct Client-to-EventStream edge or Scheduler component.
+entry_points:
+  - event_source
+  - cron_scheduler
+  - query_client
+
+components:
+  # ---------------- Event ingestion ----------------
+  event_source:
+    type: Client
+    position: { x: 40, y: 80 }
+
+  # Logical boundary around the Kafka producer SDK used by upstream systems.
+  # It batches events; it is not a public per-event REST ingestion API.
+  producer_adapter:
+    type: Service
+    position: { x: 400, y: 80 }
+    pods: 40
+    threads_per_pod: 100
+    cpu_cores: 2
+    processing_time_ms: 1
+    total_response_time_ms: 5
+    queue_limit: 50000
+    endpoints:
+      - id: ep_emit_view_events
+        method: POST
+        path: /internal/v1/view-events:batch
+        summary: "Batch view events into the producer adapter"
+        description: "Logical contract for upstream Kafka producer SDK batching; not a public per-event HTTP endpoint."
+        requestBody:
+          - { name: events, field_type: string, required: true, description: "Batch of itemId and event-time pairs" }
+
+  kafka:
+    type: EventStream
+    position: { x: 760, y: 80 }
+    throughput_limit_per_sec: 1500000
+    publish_latency_ms: 3
+    queue_limit: 5000000
+    partitions: 64
+    topics:
+      - id: topic_view_events
+        name: "view-events"
+        partitionKey: itemId
+        schema:
+          - { name: itemId, field_type: string, required: true, description: "Item being counted; Kafka partition key" }
+          - { name: timestamp, field_type: string, required: true, description: "Event-time timestamp in UTC" }
+      - id: topic_late_events
+        name: "late-events"
+        partitionKey: itemId
+        schema:
+          - { name: itemId, field_type: string, required: true, description: "Item whose event exceeded allowed lateness" }
+          - { name: timestamp, field_type: string, required: true, description: "Original event-time timestamp" }
+          - { name: observedAt, field_type: string, required: true, description: "Time Flink routed the event to reconciliation" }
+
+  flink:
+    type: StreamProcessor
+    position: { x: 1120, y: 80 }
+    parallelism: 64
+    processing_time_ms: 1
+    max_throughput: 1200000
+    buffer_size: 2000000
+
+  reconciliation_worker:
+    type: Worker
+    position: { x: 1120, y: 300 }
+    workers: 8
+    processing_time_ms: 5
+    cpu_cores: 2
+    queue_limit: 100000
+
+  # ---------------- Durable aggregates ----------------
+  postgres:
+    type: Database
+    position: { x: 1480, y: 300 }
+    max_connections: 500
+    read_latency_ms: 8
+    write_latency_ms: 12
+    replicas: 2
+    queue_limit: 20000
+    read_latency_slo_ms: 100
+    write_latency_slo_ms: 150
+    tables:
+      - id: tbl_view_count_1h
+        name: "ViewCount_1h"
+        primaryKey: itemId,windowHour
+        columns:
+          - { name: itemId, field_type: string, required: true, description: "Item id; composite primary key" }
+          - { name: windowHour, field_type: string, required: true, description: "UTC hour; composite primary key" }
+          - { name: count, field_type: number, required: true, description: "Exact count emitted by Flink as an absolute value" }
+      - id: tbl_view_count_rollups
+        name: "ViewCount_1d / ViewCount_1m / ViewCount_all"
+        primaryKey: windowType,windowId,itemId
+        columns:
+          - { name: windowType, field_type: string, required: true, description: "1d, 1m, or all" }
+          - { name: windowId, field_type: string, required: true, description: "UTC day/month boundary or all" }
+          - { name: itemId, field_type: string, required: true, description: "Item id" }
+          - { name: count, field_type: number, required: true, description: "Canonical exact aggregate" }
+
+  # ---------------- Live and canonical result publication ----------------
+  live_topk_publisher:
+    type: Service
+    position: { x: 1480, y: 40 }
+    pods: 4
+    threads_per_pod: 50
+    cpu_cores: 2
+    processing_time_ms: 3
+    total_response_time_ms: 10
+    queue_limit: 2000
+    endpoints:
+      - id: ep_publish_live_topk
+        method: PUT
+        path: /internal/v1/top-k/live/{window}
+        summary: "Publish a live top-K snapshot"
+        description: "Receives absolute ranked snapshots from Flink for sliding one-hour and approximate live views."
+        requestBody:
+          - { name: window, field_type: string, required: true, description: "sliding-1h or all-live" }
+          - { name: windowStart, field_type: string, required: false, description: "Snapshot start time" }
+          - { name: windowEnd, field_type: string, required: true, description: "Snapshot end time" }
+          - { name: items, field_type: string, required: true, description: "Ranked itemId/count entries" }
+
+  cron_scheduler:
+    type: Client
+    position: { x: 40, y: 480 }
+
+  precompute_service:
+    type: Service
+    position: { x: 760, y: 480 }
+    pods: 2
+    threads_per_pod: 50
+    cpu_cores: 4
+    processing_time_ms: 20
+    total_response_time_ms: 1000
+    queue_limit: 100
+    endpoints:
+      - id: ep_refresh_canonical_topk
+        method: POST
+        path: /internal/v1/top-k:refresh
+        summary: "Refresh canonical top-K snapshots"
+        description: "Scheduled every 30 seconds; maintains exact rollups and atomically replaces Redis sorted sets."
+        requestBody:
+          - { name: scheduledAt, field_type: string, required: true, description: "Idempotent scheduler invocation time" }
+          - { name: windows, field_type: string, required: true, description: "Windows due for refresh" }
+
+  # ---------------- Query serving ----------------
+  redis:
+    type: Cache
+    position: { x: 1840, y: 300 }
+    cache_size_mb: 512
+    working_set_mb: 128
+    access_pattern: zipfian
+    latency_hit_ms: 1
+    read_latency_slo_ms: 5
+    write_latency_slo_ms: 10
+    cacheSpaces:
+      - id: cs_topk_results
+        name: "Precomputed Top-K Results"
+        keyPattern: "topk:{mode}:{window}:{windowId}"
+        defaultTtlSeconds: 300
+        valueFields:
+          - { name: itemId, field_type: string, required: true, description: "Sorted-set member" }
+          - { name: count, field_type: number, required: true, description: "Sorted-set score" }
+          - { name: rank, field_type: number, required: true, description: "Rank returned to clients" }
+          - { name: generatedAt, field_type: string, required: true, description: "Snapshot freshness timestamp" }
+
+  query_client:
+    type: Client
+    position: { x: 40, y: 760 }
+
+  api_gateway:
+    type: ApiGateway
+    position: { x: 400, y: 760 }
+    auth_enabled: false
+    auth_latency_ms: 0
+    auth_failure_rate: 0
+    max_concurrent_requests: 50000
+    rate_limit_rps: 100000
+
+  view_query_service:
+    type: Service
+    position: { x: 760, y: 760 }
+    pods: 12
+    threads_per_pod: 100
+    cpu_cores: 2
+    processing_time_ms: 2
+    total_response_time_ms: 10
+    queue_limit: 5000
+    endpoints:
+      - id: ep_get_topk
+        method: GET
+        path: /v1/top-k
+        summary: "Return the top K items for a supported window"
+        description: "Reads a precomputed Redis snapshot and returns at most 1000 ranked items within the 50ms SLO."
+        requestBody:
+          - { name: k, field_type: number, required: false, description: "Number of results, 1-1000; default 100" }
+          - { name: window, field_type: string, required: false, description: "1h, 1d, 1m, or all; default 1h" }
+
+edges:
+  # ===== Ingestion path =====
+  - source: event_source
+    target: producer_adapter
+    edge_type: API_CALL
+    contract_id: ep_emit_view_events
+    label: "Batch view events"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 1
+
+  - source: producer_adapter
+    target: kafka
+    edge_type: KAFKA_EVENT
+    contract_id: topic_view_events
+    label: "Publish view-events"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+    input_bindings:
+      - id: ib_produce_view_events
+        source_contract_id: ep_emit_view_events
+        label: "Producer SDK batch"
+        field_mappings: []
+
+  - source: kafka
+    target: flink
+    edge_type: KAFKA_EVENT
+    contract_id: topic_view_events
+    label: "Consume by itemId"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 5
+    input_bindings:
+      - id: ib_consume_view_events
+        source_contract_id: topic_view_events
+        label: "view-events"
+        field_mappings: []
+
+  - source: flink
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_view_count_1h
+    operation: UPDATE
+    label: "UPSERT hourly counts"
+    source_handle: source-right-2
+    target_handle: target-left-1
+    latency_ms: 5
+
+  - source: flink
+    target: live_topk_publisher
+    edge_type: API_CALL
+    contract_id: ep_publish_live_topk
+    label: "Publish live snapshot"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: live_topk_publisher
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_topk_results
+    operation: SET
+    label: "Replace live ZSET"
+    source_handle: source-right-1
+    target_handle: target-top-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_publish_live_topk
+        source_contract_id: ep_publish_live_topk
+        label: "Absolute live snapshot"
+        field_mappings: []
+
+  # Very-late events are durable and reconciled into the canonical layer.
+  - source: flink
+    target: kafka
+    edge_type: KAFKA_EVENT
+    contract_id: topic_late_events
+    label: "Route very-late events"
+    source_handle: source-left-2
+    target_handle: target-right-2
+    latency_ms: 3
+
+  - source: kafka
+    target: reconciliation_worker
+    edge_type: KAFKA_EVENT
+    contract_id: topic_late_events
+    label: "Consume late-events"
+    source_handle: source-bottom-2
+    target_handle: target-left-1
+    latency_ms: 5
+    input_bindings:
+      - id: ib_consume_late_events
+        source_contract_id: topic_late_events
+        label: "late-events"
+        field_mappings: []
+
+  - source: reconciliation_worker
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_view_count_1h
+    operation: UPDATE
+    label: "Apply count corrections"
+    source_handle: source-right-1
+    target_handle: target-left-2
+    latency_ms: 5
+
+  # ===== Canonical precompute path =====
+  - source: cron_scheduler
+    target: precompute_service
+    edge_type: API_CALL
+    contract_id: ep_refresh_canonical_topk
+    label: "Trigger every 30s"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: precompute_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_view_count_1h
+    operation: SELECT
+    label: "Read hourly counts"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 5
+    input_bindings:
+      - id: ib_precompute_hourly_read
+        source_contract_id: ep_refresh_canonical_topk
+        label: "Refresh due windows"
+        field_mappings: []
+
+  - source: precompute_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_view_count_rollups
+    operation: UPDATE
+    label: "Overwrite exact rollups"
+    source_handle: source-right-2
+    target_handle: target-left-2
+    latency_ms: 5
+    input_bindings:
+      - id: ib_precompute_rollup_write
+        source_contract_id: ep_refresh_canonical_topk
+        label: "Idempotent rollup UPSERT"
+        field_mappings: []
+
+  - source: precompute_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_topk_results
+    operation: SET
+    label: "Atomically replace ZSET"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_precompute_cache_write
+        source_contract_id: ep_refresh_canonical_topk
+        label: "Canonical top-K snapshot"
+        field_mappings: []
+
+  # ===== Query path =====
+  - source: query_client
+    target: api_gateway
+    edge_type: API_CALL
+    contract_id: ep_get_topk
+    label: "GET /v1/top-k"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 15
+
+  - source: api_gateway
+    target: view_query_service
+    edge_type: API_CALL
+    contract_id: ep_get_topk
+    label: "Route top-K query"
+    source_handle: source-right-1
+    target_handle: target-left-1
+    latency_ms: 3
+
+  - source: view_query_service
+    target: redis
+    edge_type: CACHE_CALL
+    contract_id: cs_topk_results
+    operation: GET
+    label: "Read ranked snapshot"
+    source_handle: source-right-1
+    target_handle: target-bottom-1
+    latency_ms: 2
+    input_bindings:
+      - id: ib_query_cache_read
+        source_contract_id: ep_get_topk
+        label: "GET /v1/top-k"
+        field_mappings: []
+
+  - source: view_query_service
+    target: postgres
+    edge_type: DB_CALL
+    contract_id: tbl_view_count_rollups
+    operation: SELECT
+    label: "Degraded DB fallback"
+    source_handle: source-top-1
+    target_handle: target-bottom-1
+    latency_ms: 5
+    input_bindings:
+      - id: ib_query_db_fallback
+        source_contract_id: ep_get_topk
+        label: "Cache-miss fallback"
+        field_mappings: []

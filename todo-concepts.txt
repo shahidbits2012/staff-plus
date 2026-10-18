@@ -15,6 +15,9 @@
 - OAuth2.0
 - JWT
 - WebSockets
+- individual user comments feed for fast scroll - Redis
+- count min sketch
+- handling late events (top k, incentive calculation etc.)
 -
 
 

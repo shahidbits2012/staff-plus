@@ -62,10 +62,12 @@ Every deep dive within a problem page follows:
 Problem: [What NFR are we solving?]
 
 Approach A: [Name]
+  - Mermaid diagram showing the architecture / data flow for this approach
   - How it works
   - Pros / Cons
 
 Approach B: [Name]
+  - Mermaid diagram showing the architecture / data flow for this approach
   - How it works
   - Pros / Cons
 
@@ -74,6 +76,12 @@ Decision: [Which approach and WHY]
   - What we're giving up
   - When to revisit
 ```
+
+### Diagrams Rule
+
+- **Every approach** in a deep dive (and in the HLD) must include a **Mermaid diagram** (architecture, data flow, or sequence diagram) for visual understanding.
+- Add **LLD-level diagrams** (sequence diagrams with step-by-step data flow, Redis commands, SQL queries) wherever the design involves multi-step interactions between components.
+- Diagrams should be concise and readable — don't overcrowd. One diagram per approach, showing the key components and data flow that differ from other approaches.
 
 ### LSDARO — NFR Framework
 

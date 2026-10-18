@@ -15,7 +15,19 @@ You can add it to iframe present in chat system design page.
 Configure the hostnames in config files
 vetora hostname = http://localhost:3000
 staff plus hostname = http://localhost:3050
+
 ------
+- For Observability NFR, we should explain the different type of metrics to be captured like System, DB, Application etc.
+- The Staff level disucssions should be highlighted in problems page. Can you identify those and highlight them appropriately.
+- In Live Comments, in fetch Recent Comments: we should add direction query param as well. What do you say?
+- Server -> Client: UNPIN should contain commentId, not streamId, correct? Check and fix.
+- In websocket-connection-management page, add HLD explaining how setup looks like and how data flows b/w different systems in LLD.
+- In Live Comments HLD, explain more on reaction batching job. Does Redis provide schedule jobs out of the box?
+- For each approach in Deep Dive 5.1, add a design for better understanding.
+- In Approach B: Dedicated Fan-out Service, are we resuing the building block websocket-connection-management? If yes, add hyperlink.
+- Sharding & Partitioning (/distributed-systems/sharding) should be separate topics/pages. Both are huge topics in itself, which need in-depth details.
+-
+
 ------
 ------
 ------

@@ -13,6 +13,13 @@
       "problem": "/problems/real-time/rate-limiter",
       "format": "vetora-yaml",
       "file": "/designs/rate-limiter.vetora.yaml"
+    },
+    {
+      "id": "top-k",
+      "title": "Top-K Heavy Hitters",
+      "problem": "/problems/real-time/top-k",
+      "format": "vetora-yaml",
+      "file": "/designs/top-k.vetora.yaml"
     }
   ]
 }
