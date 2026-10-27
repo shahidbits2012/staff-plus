@@ -848,6 +848,13 @@ The final design combines an exact canonical pipeline with a low-latency live pi
 
 ## Appendix: Scale Assumptions
 
+<StatGrid stats={[
+  {value: '70B', label: 'View events / day', accent: 'blue'},
+  {value: '~800K/s', label: 'Peak ingest', detail: '70B ÷ 86,400', accent: 'purple'},
+  {value: '~80×', label: 'Flink write reduction', detail: '→ ~10K UPSERTs/sec', accent: 'green'},
+  {value: '~70s', label: 'Crash recovery', detail: 'Checkpoint load + replay', accent: 'amber'},
+]} />
+
 | Parameter | Value | Derivation |
 |-----------|-------|------------|
 | Events per day | 70B | YouTube Shorts scale |

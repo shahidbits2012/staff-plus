@@ -3,9 +3,15 @@ sidebar_position: 1
 title: Chat System (e.g. WhatsApp / Slack)
 ---
 
+import CheatSheet from '@site/src/cheatsheets/chat-system';
+
 # Chat System
 
 Design a real-time messaging system similar to WhatsApp or Slack.
+
+<CheatSheetToggle>
+  <CheatSheet />
+</CheatSheetToggle>
 
 ## 1. Requirements
 
@@ -18,6 +24,7 @@ Design a real-time messaging system similar to WhatsApp or Slack.
 6. **FR6**: User should see message delivery and read receipts
 7. **FR7**: User should be able to search messages within a chat
 8. **FR8**: User should see other users' online status and "last seen" time
+9. **FR9**: User can be signed in on multiple devices simultaneously — messages are delivered to all active devices, and each device maintains independent sync state
 
 ### Non-Functional Requirements (LSDARO)
 1. **NFR1 — Latency**: Message delivery should be near real-time (&lt; 500ms)
@@ -25,7 +32,7 @@ Design a real-time messaging system similar to WhatsApp or Slack.
 3. **NFR3 — Durability**: Zero message loss — guaranteed message delivery; E2E encrypted (server stores ciphertext only, deletes after delivery confirmation)
 4. **NFR4 — Availability**: 99.99% uptime
 5. **NFR5 — Resiliency**: System should be fault-tolerant across component failures; graceful degradation when individual components fail
-6. **NFR6 — Observability**: Message delivery latency (p50/p99), fan-out lag, connection registry health, per-service error rates — see [§5.10 Observability](#510-observability)
+6. **NFR6 — Observability**: Message delivery latency (p50/p99), fan-out lag, connection registry health, per-service error rates — see [§5.11 Observability](#511-observability)
 
 **Additional constraints:**
 - **E2E Encryption**: Messages must be end-to-end encrypted; server cannot read content
@@ -85,8 +92,11 @@ For simplicity, media URL + metadata (type, size, thumbnail) are embedded direct
 // Confirm media upload complete
 { type: "UPLOAD_COMPLETE", payload: { messageId } }
 
-// Heartbeat (every 30s — keeps connection alive + refreshes presence)
+// Heartbeat (every 30s — keeps the socket alive; answered in-process by the pod, no registry write)
 { type: "HEARTBEAT" }
+
+// Sync receipts missed while this device was offline (since = this device's receipt-sync cursor)
+{ type: "SYNC_SENT_STATUS", payload: { since } }
 ```
 
 ### Server → Client (WebSocket frames)
@@ -114,16 +124,20 @@ For simplicity, media URL + metadata (type, size, thumbnail) are embedded direct
 POST /v1/chats                          → create a chat (returns chatId)
 PUT  /v1/chats/:chatId/participants     → add/remove participants
 GET  /v1/inbox?before={cursor}&limit=50 → fetch unread messages (paginated, lazy loading)
-GET  /v1/sync/status?since={timestamp}  → fetch missed delivery/read receipts
+GET  /v1/sync/status?since={timestamp}  → fetch missed delivery/read receipts (REST equivalent of SYNC_SENT_STATUS; since = device's receipt-sync cursor)
 GET  /v1/users/:userId/presence         → online status + last seen (pull-based)
 ```
+
+:::note Cursor is a timestamp
+`cursor` is the `timestamp` (epoch ms) of the last message **that device** already has. Each Client owns a Redis sorted set scored by timestamp, so the server runs `ZREVRANGEBYSCORE inbox:{clientId} (cursor -inf LIMIT 0 50` — an O(log N + K) index seek that is stable under concurrent writes (unlike offset-based pagination, which shifts when new messages arrive).
+:::
 
 :::tip Why REST for Inbox Sync?
 On reconnect, a user may have hundreds of unread messages. Fetching these via paginated REST (lazy loading) avoids overwhelming the WebSocket connection with a large batch, and keeps the WebSocket free for real-time delivery of new messages arriving during sync.
 :::
 
 :::note No full message history API
-Messages are E2E encrypted and deleted from server after delivery confirmation. Full chat history lives on the client device (or client-managed backup like iCloud/Google Drive), not on the server. The Inbox API only serves messages not yet delivered.
+Messages are E2E encrypted and are no longer served once delivery is confirmed (physically removed when their TTL expires). Full chat history lives on the client device (or client-managed backup like iCloud/Google Drive), not on the server. The Inbox API only serves messages not yet delivered.
 :::
 
 ## 4. High-Level Design
@@ -168,33 +182,42 @@ Messages are E2E encrypted and deleted from server after delivery confirmation. 
 | userId | UUID | FK → User (composite PK) | `u-abc123` |
 | createdAt | timestamp | When user joined the chat | `2024-10-01T09:00:00Z` |
 
-**Message** (Cassandra — transient, deleted after all participants ACK)
+**Message** (Cassandra — transient: logically deleted once all devices ACK, physically removed by a 30-day row TTL)
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | chatId | UUID | Partition key | `chat-001` |
-| timestamp | timestamp | Clustering key (DESC) | `2024-10-11T08:31:00Z` |
-| messageId | UUID | Unique message id | `msg-555` |
+| timestamp | timestamp | Clustering key 1 (DESC) | `2024-10-11T08:31:00Z` |
+| messageId | UUID | Clustering key 2 (DESC) — unique id and tiebreaker for same-millisecond messages | `msg-555` |
 | senderId | UUID | FK → User | `u-abc123` |
 | content | blob | E2E encrypted ciphertext | `<binary>` |
 | mediaUrl | string | Encrypted media S3 key (nullable) | `"media/chat-001/msg-555/file.enc"` |
 | mediaType | string | MIME type (nullable) | `"image/jpeg"` |
+| status | enum | `UPLOADING` (media not yet confirmed) / `SENT` (accepted, fan-out intent durable) | `SENT` |
 
-**Inbox** (Redis sorted set — per-user undelivered queue; write on send, delete on ACK)
+**Inbox** (Redis sorted set — per-Client undelivered queue; write on send, delete when that device ACKs)
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| userId | string | Sorted set key: `inbox:{userId}` | `inbox:u-abc123` |
+| clientId | string | Sorted set key: `inbox:{clientId}` | `inbox:cl-phone` |
 | messageId | string | Member | `msg-555` |
 | timestamp | float | Score (epoch ms — natural ordering) | `1697013060000` |
 
-**MessageStatus** (Redis hash — receipt tracking; updated in-place, deleted with Message)
+**MessageStatus** (Redis hash — per-Client sync tracking; updated in-place and deleted with Message)
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | messageId | string | Hash key: `status:{messageId}` | `status:msg-555` |
-| userId | string | Hash field | `u-def456` |
+| clientId | string | Hash field; each target device is independent | `cl-phone` |
 | status | enum | `SENT` / `DELIVERED` / `READ` | `DELIVERED` |
+
+**RecipientMessageStatus** (Redis hash — sender-visible aggregate receipt per recipient User)
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| messageId | string | Hash key: `recipient-status:{messageId}` | `recipient-status:msg-555` |
+| userId | string | Hash field; one aggregate per recipient | `u-def456` |
+| status | enum | `SENT` / `DELIVERED` / `READ`; derived from that user's device statuses | `READ` |
 
 ### Architecture
 
@@ -244,18 +267,113 @@ See [WebSocket Connection Management at Scale](/building-blocks/websocket-connec
 
 | Concern | Decision | Why |
 |---------|----------|-----|
-| **Capacity** | ~150M concurrent connections, ~235 pods at 640K each | 500M DAU × 30% online, ~50KB per connection on 64GB servers |
+| **Capacity** | ~150M concurrent connections, ~235 pods at 640K each | 500M DAU × 30% online; 64GB pods with 50% (32GB) for sockets ÷ ~50KB per connection ≈ 640K — requires a tuned event-loop server (epoll, small per-connection buffers) |
 | **Connection Registry** | Redis Cluster | O(1) lookup at 150M keys (~20GB); ZooKeeper too slow, [consistent hashing](/distributed-systems/consistent-hashing) too rigid, gossip too laggy |
-| **Server-to-Server** | Redis Streams (per-server) | Durable delivery (Pub/Sub loses messages if subscriber is down); Kafka too heavy for dynamic routing; ~235 streams is trivial |
-| **Fan-out** | Batch by destination server | 200 group members across ~30 servers → 30 batched publishes, not 200 individual ones |
-| **Stale cleanup** | TTL (60s) + heartbeat (30s) | Clean disconnect → explicit delete; unclean → TTL expiry |
-| **Multi-device** | Per-user set of `(serverId, connId)` pairs | User with phone + laptop = 2 connections, potentially on different servers |
+| **Server-to-Server** | Redis Streams — one stream per Connection Service pod (`stream:{serverId}`, ~235 streams, capped with `MAXLEN ~`) | Durable delivery (Pub/Sub loses messages if subscriber is down); Kafka too heavy for dynamic routing; each pod reads its own stream through a consumer group (`XREADGROUP` + `XACK`) |
+| **Fan-out** | Batch by destination server | 200 group members across ~30 servers → 30 `XADD` commands (one per destination pod), not 200 individual pushes |
+| **Stale cleanup** | Per-endpoint expiry score (`now + 120s`), refreshed by the pod every 60s; client heartbeat (30s) handled in-process | Heartbeats never write to Redis (~2.5M pipelined `ZADD`/s instead of ~5M/s); clean disconnect → `ZREM`; crashed pod → its entries age out within 120s |
+| **Multi-device** | Per-user set of `(clientId, serverId, connId)` endpoints | User with phone + laptop = 2 connections, potentially on different servers |
+
+#### Connection Registry Records
+
+Redis holds **live connection endpoints**, not message data. A single user can have several endpoints: one per connected device, and potentially more than one per device while an old socket is draining after a network change.
+
+```text
+Key:    conn:{userId}                         Type: sorted set
+Member: {clientId}|{serverId}|{connId}         Score: expiresAtEpochMs
+
+conn:u-alice =
+  "cl-phone|ws-042|c-a1"       1739941260000  # iPhone socket
+  "cl-laptop|ws-117|c-b9"      1739941260000  # laptop socket
+```
+
+`clientId` is stable for a registered device; `connId` is generated for a specific WebSocket session. The `serverId` tells the Fan-out Worker which Connection Service pod owns that socket.
+
+**Phone connects** — register one routable endpoint with a 120-second expiry (`now + 120s`):
+```
+ZADD conn:user-alice 1739941260000 "cl-phone|ws-042|c-a1"
+```
+
+**Heartbeat vs. registry refresh** — the client's 30s `HEARTBEAT` is answered in-process by its pod (it owns the socket) and never touches Redis. Separately, every 60s each pod refreshes **all** of its endpoints in one pipelined batch, moving each expiry to `now + 120s`. That is 150M ÷ 60s ≈ **2.5M `ZADD`/s cluster-wide**, half of the ~5M/s that writing on every heartbeat would cost:
+```
+ZADD conn:user-alice XX 1739941320000 "cl-phone|ws-042|c-a1"   # pipelined with the pod's other endpoints
+```
+
+**Route a message** — return every endpoint whose expiry is still in the future (i.e., non-expired):
+```
+ZRANGEBYSCORE conn:user-bob (1739941200000 +inf
+                              ↑ current epoch ms   ↑ no upper bound
+```
+
+**Clean disconnect** — remove only that socket immediately; Alice's laptop remains online. A device that misses two heartbeats is closed by its pod and removed the same way:
+```
+ZREM conn:user-alice "cl-phone|ws-042|c-a1"
+```
+
+**Crashed pod** — nobody runs `ZREM`; its refreshes stop, so its endpoints become unroutable within 120s (routing ignores expired scores) and a background sweeper reclaims them:
+```
+ZREMRANGEBYSCORE conn:user-alice -inf now
+```
+
+:::note Why not one Redis hash with a single TTL?
+A hash such as `HSET conn:{userId} clientId serverId` cannot expire **one device** independently: Redis TTL applies to the whole hash. If Alice's laptop keeps refreshing that TTL, a crashed phone entry could live forever. The sorted-set score is an expiry **per connection**. Routing filters expired scores, so one device never keeps another device falsely online.
+:::
+
+#### Redis Streams for Server-to-Server Delivery
+
+Each Connection Service pod owns one Redis Stream named `stream:{serverId}`. The Messaging Service writes batched delivery instructions; the pod reads them through its own consumer group (`XREADGROUP`) and acknowledges each entry with `XACK`. Streams are capped with `MAXLEN ~` so an idle or dead pod's stream can't grow without bound.
+
+**Stream key:** `stream:ws-042` (one per pod, ~235 total)
+
+**Example: delivering msg-555 to a 200-member group with 250 active devices across ~30 pods:**
+
+```
+1. Messaging Service reads live endpoints:
+   ZRANGEBYSCORE conn:user-bob  (now +inf  →  cl-phone|ws-042|c-a1
+   ZRANGEBYSCORE conn:user-carol (now +inf →  cl-laptop|ws-117|c-b9, cl-phone|ws-042|c-d4
+   ... (250 endpoints total)
+
+2. Group by serverId:
+   ws-042: [cl-phone|c-a1, cl-phone|c-d4, ...]   (12 devices)
+   ws-117: [cl-laptop|c-b9, ...]                  (8 devices)
+   ... (~30 distinct pods)
+
+3. One XADD per destination pod (stream capped with MAXLEN ~):
+   XADD stream:ws-042 MAXLEN ~ 100000 * msgId msg-555 recipients "cl-phone|c-a1,cl-phone|c-d4,..."
+   XADD stream:ws-117 MAXLEN ~ 100000 * msgId msg-555 recipients "cl-laptop|c-b9,..."
+   → 30 writes, not 250
+```
+
+**On the receiving pod:**
+
+```
+ws-042 at boot (group created once):
+  XGROUP CREATE stream:ws-042 cg-ws-042 $ MKSTREAM
+  XREADGROUP GROUP cg-ws-042 ws-042 STREAMS stream:ws-042 0      ← drain own pending entries (PEL) after a restart
+
+ws-042 loop:
+  XREADGROUP GROUP cg-ws-042 ws-042 BLOCK 0 STREAMS stream:ws-042 >
+  → receives {msgId: msg-555, recipients: "cl-phone|c-a1,cl-phone|c-d4,..."}
+  → pushes NEW_MESSAGE over each listed connId's WebSocket
+  → XACK stream:ws-042 cg-ws-042 <entryId>
+```
+
+| Alternative | Streams | Why not |
+|---|---|---|
+| Stream per chat | Millions | Each pod subscribes to thousands of streams |
+| Stream per user | 150M | Unmanageable |
+| Pub/Sub per server | ~235 channels | Lost if subscriber is temporarily down |
+| **Stream per server pod** | **~235** | Each pod reads exactly one; durable; natural batching |
+
+:::info How a group message reaches multiple devices
+For each recipient, the Messaging Service reads their active endpoints, then batches them by destination server. If a 200-member group has 250 active devices spread across 30 Connection Service pods, it publishes **30 `XADD` commands** (one per destination pod), not 250 individual messages. Each destination pod splits the recipients list and pushes over the matching `connId` WebSocket. The same `messageId` can arrive through this real-time push and the durable Inbox sync path; the client deduplicates by `messageId`.
+:::
 
 ### 5.2 Message Ordering
 
 **Problem:** Messages within a chat must appear in order. At 2.3M msgs/sec across ~235 Chat Servers, how do we guarantee ordering?
 
-**Short answer:** Timestamp from the Chat Server + messageId as tiebreaker. This is sufficient for chat.
+**Short answer:** Timestamp from the Chat Server + messageId as tiebreaker. This is sufficient for chat. The tiebreaker is also physical: `message_id` is the last clustering column in Cassandra ([§5.3](#cassandra-schema-for-messages)), so two messages in the same chat and millisecond are distinct rows rather than one overwriting the other.
 
 **Why not something stronger?**
 
@@ -288,8 +406,8 @@ See [SQL vs NoSQL](/decisions/sql-vs-nosql) for the general decision framework, 
 | Client | Low | By userId | Low | Yes (with User) |
 | Chat | Low | By chatId | Low | Yes (with ChatParticipants) |
 | ChatParticipants | Low | By chatId (all members) | Low | Yes (with Chat) |
-| Message | **100B/day** | By chatId + timestamp range | Medium (deleted after all ACKs) | No |
-| Inbox | **High** | By userId (all unread) | **Very high** (insert on send, delete on ACK) | No |
+| Message | **100B/day** | By chatId + timestamp range | Low (no per-row deletes — rows expire via TTL) | No |
+| Inbox | **High** | By clientId (each device's unread messages) | **Very high** (insert on send, delete on device ACK) | No |
 | MessageStatus | **High** | By messageId | **High** (frequent in-place updates) | No |
 
 #### Decisions
@@ -298,15 +416,15 @@ See [SQL vs NoSQL](/decisions/sql-vs-nosql) for the general decision framework, 
 |-------|-------|-----|
 | **User, Client** | [PostgreSQL](/building-blocks/postgresql) | Small dataset, relational, strong consistency, stable schema |
 | **Chat, ChatParticipants** | [PostgreSQL](/building-blocks/postgresql) + Redis cache | Relational joins for membership queries; Redis cache for hot-path reads (group membership checked on every message send — cache hit rate >99.9% since membership changes are rare) |
-| **Message** | [Cassandra](/building-blocks/cassandra) | Massive write volume; `partition_key = chatId, clustering_key = timestamp DESC` gives single-partition reads for "last N messages in chat X"; TimeWindowCompaction for natural time-series data |
-| **Inbox** | [Redis sorted set](/building-blocks/redis) | Transient queue pattern (insert, read, delete) — high churn would create tombstone storms in Cassandra; Redis sorted sets give clean deletes, natural timestamp ordering via score; bounded size since entries are deleted after ACK |
+| **Message** | [Cassandra](/building-blocks/cassandra) | Massive write volume; `partition_key = chatId, clustering = (timestamp DESC, messageId DESC)` gives single-partition reads for "last N messages in chat X"; row TTL + TimeWindowCompaction for natural time-series data |
+| **Inbox** | [Redis sorted set](/building-blocks/redis) | Per-Client transient queue (insert, device ACK, delete) — high churn would create tombstone storms in Cassandra; sorted sets give clean deletes, timestamp ordering via score, and independent phone/laptop sync |
 | **MessageStatus** | [Redis hash](/building-blocks/redis) | Short-lived (deleted with Message); frequent in-place updates (SENT → DELIVERED → READ) — Cassandra would create tombstones on each status change; Redis HSET is true in-place update |
 
 #### Durability Strategy
 
 Redis Inbox and MessageStatus are ephemeral but important. If Redis crashes:
 
-- **Inbox recovery:** Cassandra Message table still has the data. On reconnect, client provides `lastReceivedTimestamp` → server queries Messages by chatId for the user's chats since that timestamp. Slower, but correct.
+- **Inbox recovery:** Cassandra Message table still has the data. On reconnect, a device provides `lastReceivedTimestamp` → server queries Messages for that device's chats since that timestamp. Slower, but correct.
 - **MessageStatus recovery:** Lost receipt statuses are acceptable — sender sees "sent" instead of "delivered" until the next interaction triggers a fresh status check.
 
 Redis AOF persistence (`appendfsync everysec`) limits data loss to ~1 second.
@@ -326,12 +444,16 @@ CREATE TABLE messages (
     content    BLOB,          -- E2E encrypted ciphertext
     media_url  TEXT,
     media_type TEXT,
-    PRIMARY KEY (chat_id, timestamp)
-) WITH CLUSTERING ORDER BY (timestamp DESC)
+    status     TEXT,          -- UPLOADING | SENT
+    PRIMARY KEY ((chat_id), timestamp, message_id)
+) WITH CLUSTERING ORDER BY (timestamp DESC, message_id DESC)
+  AND default_time_to_live = 2592000   -- 30 days = offline retention window
   AND compaction = {'class': 'TimeWindowCompactionStrategy', 'compaction_window_size': '1', 'compaction_window_unit': 'DAYS'};
 ```
 
-TimeWindowCompaction is ideal here — messages are time-ordered and ephemeral (deleted after ACK). Entire SSTables for expired time windows can be dropped without tombstone overhead.
+`message_id` in the clustering key is the tiebreaker: with `(chat_id, timestamp)` alone, two messages in the same chat and millisecond would share a primary key and the later write would silently overwrite the earlier one.
+
+**Delete-on-ACK is logical, not physical.** Once every target device ACKs, its Inbox entries are removed and the server never serves the row again. The row itself is never `DELETE`d: every row is written with a TTL equal to the 30-day offline retention window, and because rows arrive in time order, each 1-day TWCS window holds rows that all expire together — Cassandra drops the whole expired SSTable as a file delete. No per-row `DELETE` means no tombstones to scan or compact (see [Cassandra: TWCS](/building-blocks/cassandra#time-window-compaction-strategy-twcs)). Trade-off: delivered ciphertext lingers on disk until its TTL expires — acceptable because the server only ever holds ciphertext it cannot read.
 
 #### Indexing Strategy
 
@@ -354,7 +476,7 @@ PRIMARY KEY (chat_id, user_id)
 CREATE INDEX idx_cp_user_id ON chat_participants(user_id);
 ```
 
-**Cassandra:** Indexing is implicit in the schema — `partition_key = chat_id, clustering_key = timestamp DESC`. The only query ("messages in chat X by time") is a single-partition range scan. No secondary indexes — they're an anti-pattern in Cassandra at scale (scatter-gather across nodes).
+**Cassandra:** Indexing is implicit in the schema — `partition_key = chat_id, clustering = (timestamp DESC, message_id DESC)`. The only query ("messages in chat X by time") is a single-partition range scan. No secondary indexes — they're an anti-pattern in Cassandra at scale (scatter-gather across nodes).
 
 **Redis:** Data structures *are* the index — sorted sets give timestamp ordering, hashes give O(1) field lookup, keys give O(1) existence check. No separate indexing concept.
 
@@ -394,11 +516,11 @@ Client:
 The server becomes a blind router plus a transient store — every feature that needs content moves to the client or out of scope:
 
 - Server **cannot** provide search over messages (ciphertext only)
-- Server **cannot** provide message history to new devices (deleted after ACK)
+- Server **cannot** provide message history to new devices (no longer served after ACK, expired by TTL)
 - Message content in Cassandra and Inbox entries are **ciphertext** — opaque blobs to the server
 - Spam detection and content moderation **cannot** operate on message content (out of scope, as specified)
 
-Second-order effect: because the server can't serve history, it doesn't need to keep it — which is what makes delete-on-ACK, TWCS SSTable drops, and a bounded Redis Inbox possible.
+Second-order effect: because the server can't serve history, it doesn't need to keep it — which is what makes logical delete-on-ACK, TTL-expired TWCS SSTable drops, and a bounded Redis Inbox possible.
 :::
 
 ### 5.5 Write-Time Fan-Out
@@ -413,7 +535,7 @@ The system uses two separate messaging layers, running in parallel:
 
 | Layer | Technology | Purpose | Latency |
 |-------|-----------|---------|---------|
-| **Real-time delivery** | Redis Streams (per Chat Server) | Push to online users' WebSocket connections | ~2-5ms |
+| **Real-time delivery** | Redis Streams (one per Connection Service pod) | Push to online users' WebSocket connections | ~2-5ms |
 | **Durable fan-out** | [Kafka](/building-blocks/kafka) (partitioned by chatId) | Persist Inbox entries for all participants | ~10-50ms |
 
 :::staff[Two messaging layers: "deliver now" vs. "everyone eventually"]
@@ -424,27 +546,37 @@ These serve different concerns. Redis Streams handles the "deliver now" path. Ka
 
 ```mermaid
 graph TD
-    CS[Messaging Service] -->|"1. persist"| CASS[(Cassandra)]
-    CS -->|"2. publish"| KAFKA[Kafka]
-    CS -->|"3. lookup online"| REDIS[(Redis Registry)]
-    CS -->|"4. push online"| RS[Connection Service]
+    subgraph Real-time path
+        CONN[Connection Service] -->|"1. gRPC"| MS[Messaging Service]
+        MS -->|"2. persist ciphertext<br/>+ outbox intent"| CASS[(Cassandra)]
+        MS -->|"3. lookup online"| REG[(Redis Registry)]
+        MS -->|"4. Redis Streams<br/>batched by serverId"| CONN2[Target Connection Services]
+        CONN2 -->|"5. WebSocket push"| DEV[Online devices]
+    end
 
-    KAFKA --> FOS[Fan-out Worker]
-    FOS -->|"fetch members"| CACHE[(Redis Cache)]
-    FOS -->|"write per-user"| INBOX[(Redis Inbox)]
-    FOS -->|"offline users"| NOTIF[Kafka notifications]
-    NOTIF --> NW[Notification Worker]
+    subgraph Durable path
+        MS -->|"3. Kafka produce acks=all<br/>key = chatId, then ack SENT"| KAFKA[(Kafka<br/>message-fanout)]
+        CASS -.->|"outbox relay<br/>republish on crash"| KAFKA
+        KAFKA -->|"recipientSnapshot<br/>+ membershipVersion"| FOS[Fan-out Worker]
+        FOS -->|"write per-client"| INBOX[(Redis Inbox)]
+        FOS -->|"offline users"| NOTIF[(Kafka<br/>notifications)]
+        NOTIF --> NW[Notification Worker]
+    end
 ```
 
 **Step by step:**
 
-1. **Chat Server** receives message, persists to Cassandra (async)
-2. **Chat Server** publishes to Kafka topic `message-fanout` (partition key = chatId)
-3. **Chat Server** looks up online participants in Redis, pushes via Redis Streams for real-time WebSocket delivery
-4. **Fan-out Service** (Kafka consumer) processes the event:
-   - Fetches chat participants from Redis cache
-   - Writes an Inbox entry (Redis sorted set) for each participant
-   - Triggers push notification for offline users
+1. **Connection Service** receives `SEND_MESSAGE` over WebSocket, forwards to Messaging Service via gRPC
+2. **Messaging Service** validates membership, captures the recipient-device snapshot + `membershipVersion`, and persists the ciphertext plus a fan-out intent (outbox row) to Cassandra
+3. **In parallel:**
+   - Publishes to Kafka topic `message-fanout` (partition key = chatId, `acks=all`) for durable fan-out; once Kafka acknowledges, the sender gets `SENT`. If the service crashes between the Cassandra write and the Kafka ack, an outbox relay republishes the same `messageId`
+   - Looks up online recipient endpoints in Redis Connection Registry
+4. **Real-time path:** groups endpoints by `serverId`, writes one Redis Streams batch per target Connection Service pod
+5. **Target Connection Services** push `NEW_MESSAGE` over the already-open WebSocket to each online device
+6. **Durable path (async):** Fan-out Worker consumes from Kafka:
+   - Uses the `recipientSnapshot` + `membershipVersion` carried in the event — it never re-reads membership
+   - Writes an Inbox entry (`inbox:{clientId}`) for each recipient device
+   - Emits notification event for users with no live endpoint
 
 #### Why Two Layers Instead of One?
 
@@ -456,22 +588,65 @@ graph TD
 | Ordering per chat | ⚠️ Per-server ordering only | ✅ Partition by chatId = strict order | ✅ Kafka for ordering |
 | Backpressure | ⚠️ Manual | ✅ Consumer lag, auto-managed | ✅ Kafka absorbs spikes |
 
-#### Kafka Configuration for Fan-Out
+#### Kafka Topics
+
+Two topics serve different concerns:
+
+**`message-fanout`** — durable fan-out of messages to every recipient device
 
 ```
 Topic: message-fanout
-  Partitions: 200 (scale with fan-out service instances)
-  Partition key: chatId (ordering per chat)
+  Partition key: chatId → all messages for one chat land on the same partition
+                          → strict ordering per chat guaranteed
+  Partitions: 200 (max 200 Fan-out Worker consumers)
   Replication factor: 3
   min.insync.replicas: 2
 
-Producer (Chat Server):
+Message schema:
+  {
+    messageId,           -- idempotency key
+    chatId,              -- partition key
+    senderId,
+    membershipVersion,   -- version of the membership snapshot at send time
+    recipientSnapshot: [ -- captured by Messaging Service, NOT re-read by worker
+      { clientId, userId },
+      ...
+    ]
+  }
+```
+
+**`notifications`** — wake-up signal for offline users via APNs/FCM
+
+```
+Topic: notifications
+  Partition key: userId → messages for the same user land on the same partition
+                          → Notification Worker can batch into one push
+  Partitions: 32
+  Replication factor: 3
+
+Message schema:
+  {
+    userId,              -- partition key
+    chatId,
+    senderName,
+    preview              -- opaque E2E-encrypted blob (server can't read it)
+  }
+```
+
+:::note Why chatId for message-fanout but userId for notifications?
+`message-fanout` partitions by `chatId` so all messages in one chat are processed **in order** by a single Fan-out Worker. `notifications` partitions by `userId` so all pending notifications for the same user land on the same consumer — enabling batching ("Alice: 50 new messages") instead of 50 separate pushes.
+:::
+
+#### Kafka Producer and Consumer Configuration
+
+```
+Producer (Messaging Service):
   acks: all
   enable.idempotence: true
   linger.ms: 5 (small batch window for throughput)
   compression.type: lz4
 
-Consumer (Fan-out Service):
+Consumer (Fan-out Worker):
   group.id: fanout-service
   auto.offset.reset: earliest
   enable.auto.commit: false (manual commit after Inbox writes)
@@ -481,25 +656,145 @@ Consumer (Fan-out Service):
 #### Fan-Out Latency Budget
 
 ```
-Chat Server → Kafka publish:        ~5ms  (async, batched)
+Messaging Service → Kafka publish:   ~5ms  (batched, linger.ms=5)
 Kafka replication:                   ~5ms  (acks=all, RF=3)
 Consumer poll interval:              ~10ms (near real-time consumption)
-Fetch participants (Redis cache):    ~2ms
+Recipients from event snapshot:      ~0ms  (carried in the event, no lookup)
 Write 200 Inbox entries (pipeline):  ~10ms (Redis pipeline, batched)
-Total Inbox fan-out:                ~32ms
+Total Inbox fan-out:                ~30ms
 
 Real-time WebSocket delivery (parallel): ~5-10ms
 ```
 
-Both paths complete well within the 500ms budget. Online users see the message via WebSocket in ~10ms; Inbox entries are written within ~32ms as a durability backstop.
+Both paths complete well within the 500ms budget. Online users see the message via WebSocket in ~10ms; Inbox entries are written within ~30ms as a durability backstop.
 
 #### Scaling the Fan-Out Service
 
 - **Add consumers** up to the partition count (200 partitions = max 200 consumers)
 - **Monitor consumer lag** — if lag grows, add consumers or increase `max.poll.records`
-- **[Idempotent writes](/patterns/idempotency)** — Fan-out Service uses `messageId + userId` as idempotency key for Inbox writes; safe to replay on crash
+- **[Idempotent writes](/patterns/idempotency)** — Fan-out Service uses `messageId + clientId` as idempotency key for Inbox writes; safe to replay on crash
 
-### 5.6 Media Upload Pipeline
+### 5.6 Delivery & Read Receipts
+
+**Problem:** How do we propagate delivery and read receipts (FR6) back to the sender — and in group chats, to all participants — without creating a secondary fan-out storm?
+
+#### Receipt Lifecycle
+
+Every target device transitions through three states in the `MessageStatus` Redis hash; `RecipientMessageStatus` holds the sender-visible aggregate per recipient user:
+
+```
+SENT → DELIVERED → READ
+```
+
+- **SENT** — server persisted the message and its fan-out intent is durable (Inbox entries are written asynchronously afterwards by the Fan-out Worker)
+- **DELIVERED** — recipient's device received the message (client sent `ACK` frame)
+- **READ** — recipient opened the chat (client sent `READ` frame)
+
+#### 1:1 Receipt Flow
+
+```mermaid
+sequenceDiagram
+    participant A as Sender (Alice)
+    participant S as Messaging Service
+    participant R as Redis (MessageStatus)
+    participant B as Recipient (Bob)
+
+    A->>S: SEND_MESSAGE { chatId, content }
+    S->>R: HSET status:{msgId} bob-phone SENT bob-laptop SENT
+    S->>B: NEW_MESSAGE (via Fan-out → WS)
+    B->>S: ACK { messageId }
+    S->>R: HSET status:{msgId} bob-phone DELIVERED
+    S->>R: HSET recipient-status:{msgId} u-bob DELIVERED
+    S->>A: MESSAGE_ACK { messageId, status: delivered, userId: bob }
+    Note over B: Bob opens the chat
+    B->>S: READ { messageId }
+    S->>R: HSET status:{msgId} bob-phone READ
+    S->>R: HSET recipient-status:{msgId} u-bob READ
+    S->>A: MESSAGE_ACK { messageId, status: read, userId: bob }
+```
+
+Key detail: receipt updates are **fire-and-forget over WebSocket** — if Alice is offline when Bob reads, the receipt is not retried in real-time. Alice's devices sync missed receipts on reconnect via `SYNC_SENT_STATUS` (or `GET /v1/sync/status?since={timestamp}`) — see [Offline Receipt Sync](#offline-receipt-sync). Status hash fields are per **device** (`clientId`) in `status:{msgId}` and per **user** (`userId`) in `recipient-status:{msgId}`.
+
+#### Group Receipt Flow
+
+In a 200-member group, when Bob reads a message from Alice, who needs to know?
+
+**WhatsApp model:** only the **sender** sees per-participant delivery/read status (in message info). Other members don't see Bob's receipt — this is a deliberate product decision that also solves the fan-out problem.
+
+```mermaid
+sequenceDiagram
+    participant B as Bob
+    participant S as Messaging Service
+    participant R as Redis (MessageStatus)
+    participant A as Alice (sender)
+
+    Note over B: Bob receives message in 200-member group
+    B->>S: ACK { messageId }
+    S->>R: HSET status:{msgId} bob-phone DELIVERED
+    S->>R: HSET recipient-status:{msgId} u-bob DELIVERED
+    S->>A: MESSAGE_ACK { messageId, status: delivered, userId: bob }
+    Note over S: Only Alice gets the receipt — NOT all 199 members
+```
+
+| Approach | Receipt fan-out per message per reader | Write amplification |
+|----------|---------------------------------------|---------------------|
+| **Broadcast to all members** | O(N) — every member gets every receipt | 200 readers × 200 WS pushes = 40K receipt deliveries per message |
+| **Sender-only** (chosen) | O(1) — only sender gets the receipt | 200 readers × 1 WS push = 200 receipt deliveries per message |
+
+:::staff[Why receipts go only to the sender]
+This is where product design and system design intersect. Broadcasting every receipt to every group member creates a **secondary fan-out storm**: a single message in a 200-member group generates up to 200 delivery receipts × 200 fan-out writes = **40K WS pushes** just for delivery status. Sender-only receipts reduce this to 200 pushes — a 200× reduction. WhatsApp makes the same choice: group message info (per-participant ticks) is visible only to the sender, and only on demand (pull, not push). The double-tick on the message bubble shows the **aggregate** (all delivered / all read), which requires only a single status check, not per-member fan-out.
+:::
+
+#### Aggregate Group Ticks
+
+The double-tick (✓✓) and blue tick on a group message represent aggregate status:
+
+```
+Single tick (✓):   Message persisted and fan-out intent is durable
+Double tick (✓✓):  ALL recipient users delivered (all HGET recipient-status:{msgId} are DELIVERED or READ)
+Blue tick:         ALL recipient users read (all HGET recipient-status:{msgId} are READ)
+```
+
+A device ACK first updates its own `status:{messageId}` field. The service then updates that user’s aggregate field in `recipient-status:{messageId}`; the sender's client periodically checks aggregate status, or the server pushes an aggregate update when the **last recipient user** transitions:
+
+```
+On a device receipt update:
+  1. HSET status:{msgId} {clientId} DELIVERED
+  2. HSET recipient-status:{msgId} {userId} DELIVERED  # first verified device is enough
+  3. HGETALL recipient-status:{msgId} → check all recipient users
+  4. If all are delivered → push MESSAGE_ACK { messageId, status: all_delivered } to sender
+```
+
+The final aggregate check is O(N recipients), but happens at most once per newly advanced recipient status and is acceptable for bounded group sizes.
+
+#### Offline Receipt Sync
+
+When one of Alice's devices reconnects after being offline, it sends `SYNC_SENT_STATUS` over the WebSocket, or calls the REST equivalent:
+
+```
+GET /v1/sync/status?since={timestamp}
+```
+
+`since` is **that device's own receipt-sync cursor** — the point up to which it has already applied receipt updates — not the user's `last_seen` (another of Alice's devices may have been online and advanced its own cursor meanwhile). The server answers from `MessageStatus` (per-device state, for message info) and `RecipientMessageStatus` (per-user aggregate, which drives the group ticks) for messages Alice sent whose status changed after the cursor, and returns batched updates plus a new cursor. This avoids storing receipt events durably — the current state is the source of truth, not a log of transitions.
+
+```mermaid
+sequenceDiagram
+    participant A as Alice's laptop (reconnects)
+    participant S as Messaging Service
+    participant R as Redis (status hashes)
+
+    A->>S: SYNC_SENT_STATUS since=1729382400000 (laptop's receipt cursor)
+    S->>R: Read status and recipient-status for messages sent by Alice
+    R-->>S: [ {msgId: m1, bob: READ, carol: DELIVERED}, {msgId: m2, bob: DELIVERED} ]
+    S-->>A: Batched receipt updates + new cursor
+    Note over A: Client updates ticks on UI
+```
+
+:::note Receipt state is current-state, not an event-log
+`MessageStatus` stores the current state per **device**, and `RecipientMessageStatus` stores the current sender-visible state per **recipient user**. Both use true in-place `HSET` updates — no append, no tombstones. The trade-off: we lose transition timestamps (when exactly did Bob read?). WhatsApp shows these in message info, which would require timestamp fields per device/status or a separate receipt-event log. For our design, current state is sufficient.
+:::
+
+### 5.7 Media Upload Pipeline
 
 **Problem:** How do we handle media file uploads (images, videos) at scale without bottlenecking Chat Servers?
 
@@ -507,7 +802,7 @@ See [S3 / Object Storage](/building-blocks/s3-object-storage) for details on pre
 
 #### Why Not Upload Through Chat Server?
 
-At 100B msgs/day, even if 10% have media (~10B), routing files through Chat Servers would saturate their bandwidth and memory. A 5MB image × 1B uploads/day = **5 PB/day** of traffic through servers that should be handling lightweight WebSocket frames.
+At 100B msgs/day, even if only ~1% carry media (~1B uploads/day), routing files through Chat Servers would saturate their bandwidth and memory: ~5MB average × 1B uploads/day ≈ **5 PB/day** of traffic through servers that should be handling lightweight WebSocket frames.
 
 #### Flow: Pre-Signed URL Upload
 
@@ -528,8 +823,8 @@ sequenceDiagram
     C->>S3: PUT encrypted thumbnail via pre-signed URL
     C->>CS: UPLOAD_COMPLETE (messageId)
     CS->>S3: HEAD request (verify object exists, ~5ms)
-    CS->>CS: Update Message status → SENT
-    CS->>FOS: Trigger Inbox fan-out (via Kafka)
+    CS->>CS: Update Message status → SENT + write outbox intent
+    CS->>FOS: Trigger Inbox fan-out (via Kafka, acks=all)
     CS->>C: { status: SENT }
 ```
 
@@ -574,11 +869,11 @@ UUIDs in chatId and messageId naturally distribute requests across S3's internal
 
 #### Cleanup
 
-Since messages are deleted after all participants ACK:
-- S3 objects are deleted when the Message row is deleted
-- **S3 lifecycle policy** as a safety net: auto-delete objects older than 30 days (catches orphaned uploads from failed flows)
+Since messages are logically deleted once all target devices ACK:
+- S3 objects are deleted at that point (the Message row itself just waits for its 30-day TTL)
+- **S3 lifecycle policy** as a safety net: auto-delete objects older than 30 days — the same window as the Message TTL (catches orphaned uploads from failed flows)
 
-### 5.7 Notification Service
+### 5.8 Notification Service
 
 **Problem:** How do we notify offline users that they have new messages?
 
@@ -615,7 +910,7 @@ WhatsApp shows sender name and message preview in push notifications. How? The p
 For simplicity, we skip this and show "New message from [sender]" only.
 :::
 
-### 5.8 Presence & Last Seen
+### 5.9 Presence & Last Seen
 
 **Problem:** How do we track online/offline status at 500M DAU without overwhelming the database?
 
@@ -625,22 +920,35 @@ See [Presence & Heartbeat](/patterns/presence-heartbeat) for the general pattern
 
 | Concern | Decision | Why |
 |---------|----------|-----|
-| **Online status** | Redis key with TTL: `presence:{userId}` EX 60 | Ephemeral, self-cleaning, sub-ms lookup |
-| **Heartbeat** | Client sends every 30s, refreshes Redis TTL | Self-healing — no reliance on clean disconnect |
-| **Last seen (persistent)** | PostgreSQL `last_seen` updated on disconnect only | 5M heartbeat writes/sec to PG is impossible; disconnect events are ~50K/sec |
-| **Crash recovery** | Redis TTL expires after 60s; PG `last_seen` is at most 60s stale | Acceptable for "last seen X minutes ago" display |
+| **Online status** | At least one non-expired endpoint in `conn:{userId}` | Connection registry already tracks each device; avoids a second conflicting presence source |
+| **Heartbeat** | Each client heartbeats every 30s; its pod answers in-process (no Redis write). Every 60s the pod refreshes each of its endpoints to `now + 120s` in one pipelined batch (~2.5M `ZADD`/s cluster-wide) | Decouples liveness from registry writes; per-endpoint scores mean a phone failure never expires a user's active laptop |
+| **Last seen (persistent)** | PostgreSQL `last_seen` updated only when the **last** endpoint disappears | Millions of registry refreshes/sec could never go to PG; a user with another live device is still online |
+| **Crash recovery** | Clean disconnects `ZREM` immediately; a crashed pod's endpoints stop being refreshed and expire within 120s, are ignored by readers, and are swept later. Presence and PG `last_seen` can therefore be up to ~120s stale after a pod crash | Self-healing without relying on clean disconnect |
 | **Query model** | Pull-based: `GET /v1/users/:userId/presence` | Push-based = tracking social graph on every connect/disconnect — too expensive at 500M DAU |
 
-```
-Connect:     Redis SET presence:{userId} NOW EX 60
-Heartbeat:   Redis SET presence:{userId} NOW EX 60   (Redis only, no PG write)
-Disconnect:  Redis DEL + PG UPDATE users SET last_seen = NOW
-Crash:       Redis TTL expires after 60s (PG at most 60s stale)
+```text
+Connect:
+  ZADD conn:{userId} now+120s "{clientId}|{serverId}|{connId}"
+
+Client HEARTBEAT (every 30s):
+  handled in-process by the pod (update local lastSeen), no Redis write
+
+Pod refresh (every 60s, pipelined for all local endpoints):
+  ZADD conn:{userId} XX now+120s "{clientId}|{serverId}|{connId}"
+
+Disconnect:
+  ZREM conn:{userId} "{clientId}|{serverId}|{connId}"
+  If ZRANGEBYSCORE conn:{userId} (now +inf is empty:
+    PostgreSQL UPDATE users SET last_seen = NOW
+
+Presence lookup:
+  ZRANGEBYSCORE conn:{userId} (now +inf
+  Any result → online; no result → return PostgreSQL last_seen
 ```
 
-Reading presence: check Redis first (online?), fall back to PG (last seen).
+Presence is derived from the same per-device registry used for routing. This ensures a user stays online while **any** registered device remains connected. Staleness is bounded by the registry expiry: immediate on clean disconnect, at most ~120s when a pod crashes.
 
-### 5.9 Final Architecture
+### 5.10 Final Architecture
 
 After all deep dives, the system has evolved from a single Chat Server to a full microservices architecture:
 
@@ -652,7 +960,7 @@ After all deep dives, the system has evolved from a single Chat Server to a full
 | **User Service** | User, Client, E2E Key Bundles, Presence | PostgreSQL + Redis | Stateless, low traffic |
 | **Chat Service** | Chat, ChatParticipants | PostgreSQL + Redis cache | Stateless, publishes membership events to Kafka |
 | **Messaging Service** | Message, MessageStatus | Cassandra + Redis | Stateless, high throughput |
-| **Inbox Service** | Inbox | Redis (sorted sets) | IO-bound, high write/delete churn |
+| **Inbox Service** | Per-device Inbox | Redis (sorted sets) | IO-bound, high write/delete churn |
 | **Fan-out Worker** | Kafka consumer — orchestrates Inbox writes + notifications | — (stateless) | CPU-bound, scales with Kafka partitions |
 | **Media Service** | Pre-signed URL generation, S3 lifecycle | S3 | Stateless, lightweight |
 | **Notification Worker** | Push notifications (APNs/FCM) | Kafka consumer (`notifications` topic) | Async, rate-limited by platform APIs |
@@ -662,62 +970,44 @@ After all deep dives, the system has evolved from a single Chat Server to a full
 <DesignPreview file="chat-system.vetora.yaml" height={600} title="Chat System — Final Architecture (Vetora)" />
 
 ```mermaid
-graph LR
-    subgraph Clients
-        C[Phone / Laptop / Tablet]
+flowchart LR
+    C[Clients<br/>Phone · Laptop · Tablet] <-->|WS / REST| GW[API Gateway<br/>TLS · JWT · routing]
+
+    GW --> CONN
+    GW --> CHAT
+    GW --> USER
+    GW --> MEDIA
+
+    subgraph hot [Real-time hot path]
+        direction TB
+        CONN[Connection Service] <-->|Redis Streams<br/>one per pod| REDIS_REG[(Redis Cluster<br/>connections · presence<br/>Inbox · receipts)]
+        CONN -->|gRPC| MSG[Messaging Service]
+        MSG <--> REDIS_REG
+        MSG --> CASS[(Cassandra<br/>ciphertext)]
     end
 
-    subgraph Edge
-        GW[API Gateway L7]
+    subgraph cold [REST cold path]
+        direction TB
+        CHAT[Chat Service] <--> PG[(PostgreSQL<br/>users · chats)]
+        CHAT <--> REDIS_CACHE[(Redis<br/>membership cache)]
+        USER[User Service] <--> PG
+        MEDIA[Media Service] --> S3[(S3<br/>encrypted media)]
     end
 
-    subgraph Services
-        CONN[Connection Service]
-        MS[Messaging Service]
-        CS[Chat Service]
-        IS[Inbox Service]
-        US[User Service]
-        MDS[Media Service]
+    subgraph async [Durable async pipeline]
+        direction TB
+        KAFKA[(Kafka<br/>message-fanout<br/>notifications)]
+        FANOUT[Fan-out Worker] <--> REDIS_REG
+        FANOUT <--> REDIS_CACHE
+        NOTIFY[Notification Worker]
     end
 
-    subgraph Async_Pipeline[Async Pipeline]
-        KF[Kafka]
-        FOS[Fan-out Worker]
-        NS[Notification Worker]
-    end
-
-    subgraph Data_Stores[Data Stores]
-        PG[(PostgreSQL)]
-        CASS[(Cassandra)]
-        REDIS[(Redis Cluster)]
-        S3[(S3)]
-    end
-
-    C <-->|WebSocket| GW
-    C -->|upload| S3
-    GW <--> CONN
-    GW --> US
-    GW --> CS
-    GW --> MDS
-
-    CONN <--> REDIS
-    CONN --> MS
-
-    MS --> CASS
-    MS --> KF
-    MS <--> REDIS
-
-    KF --> FOS
-    FOS --> IS
-    FOS --> NS
-    FOS <--> REDIS
-
-    IS <--> REDIS
-    US <--> PG
-    CS <--> PG
-    CS <--> REDIS
-    MDS --> S3
+    MSG -->|produce| KAFKA
+    KAFKA --> FANOUT
+    FANOUT -->|offline| NOTIFY
 ```
+
+**How to read it:** traffic enters from the left. The **hot path** (top) handles real-time messaging — Connection Service, Messaging Service, Redis, and Cassandra. The **cold path** (middle) handles REST operations — Chat Service, User Service, PostgreSQL, and S3. The **async pipeline** (bottom) handles durable fan-out — Kafka feeds the Fan-out Worker, which writes per-device Inbox entries into Redis and triggers notifications for offline users. Data stores sit next to the services that own them, not in a separate layer.
 
 #### Inter-Service Communication
 
@@ -727,7 +1017,7 @@ graph LR
 | Connection Service → Messaging Service | [gRPC](/building-blocks/grpc) | Low-latency, typed contracts |
 | Messaging Service → Kafka | Kafka produce | Durable async fan-out (partitioned by chatId) |
 | Kafka → Fan-out Worker | Kafka consume | Scalable, replayable, ordered per chat |
-| Fan-out Worker → Redis (Inbox) | CACHE_CALL (Redis sorted set) | Write per-user inbox entries directly |
+| Fan-out Worker → Redis (Inbox) | CACHE_CALL (Redis sorted set) | Write one inbox entry per target Client device |
 | Fan-out Worker → Kafka (`notifications`) | Kafka produce | Notification events for offline users |
 | Kafka → Notification Worker | Kafka consume | Durable, replayable notification delivery |
 | Messaging Service → Connection Service | [Redis Streams](/building-blocks/server-to-server-communication) | Real-time delivery to online users |
@@ -740,11 +1030,166 @@ graph LR
 |-------|--------------|----------------|
 | **[PostgreSQL](/building-blocks/postgresql)** | User, Client, Chat, ChatParticipants | Small, relational, strong consistency |
 | **Cassandra** | Message (ciphertext) | Massive write volume, partitioned by chatId, time-bucketed |
-| **Redis Cluster** | Connection Registry, Inbox (sorted sets), MessageStatus (hashes), Presence (TTL keys), ChatParticipants cache | Sub-ms latency, rich data structures, clean deletes |
+| **Redis Cluster** | Connection Registry, per-device Inboxes (sorted sets), device + recipient receipt hashes, Presence, ChatParticipants cache | Sub-ms latency, rich data structures, clean deletes |
 | **S3** | Encrypted media files | Virtually unlimited, 11-nines durability, pre-signed URL access |
 | **Kafka** | message-fanout topic, notifications topic, membership-events topic | Durable async pipeline, ordering per chat, replay on failure |
 
-### 5.10 Observability
+#### System Stories: How the Pieces Work Together
+
+Read these flows in order. They turn the architecture into one consistent story: a device connects, a group changes, a message is made durable, active devices receive it immediately, offline devices catch up later, and receipts close the loop.
+
+##### 1. Create or Update a Chat
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as API Gateway
+    participant CS as Chat Service
+    participant PG as PostgreSQL
+    participant R as Redis Cache
+    participant K as Kafka
+    participant WS as Connection Service
+
+    C->>G: POST /v1/chats or PUT /v1/chats/{id}/participants
+    G->>CS: Authenticated request
+    CS->>PG: Transaction: Chat + ChatParticipants change
+    PG-->>CS: Commit
+    CS->>R: Invalidate / refresh chat:{chatId}:members
+    CS->>K: membership-events {chatId, membershipVersion}
+    CS->>WS: CHAT_CREATED or CHAT_UPDATED for online devices
+    WS-->>C: Push membership update
+    Note over C: Group clients rotate/distribute Sender Keys<br/>pairwise after a membership change
+```
+
+1. The Chat Service commits the chat and membership change in PostgreSQL; that database is the membership source of truth.
+2. It refreshes the Redis membership cache used by the message hot path and emits a versioned membership event for other consumers.
+3. Online devices receive `CHAT_CREATED` or `CHAT_UPDATED`; the clients then perform the E2E Sender Key rotation/distribution themselves. The server only relays encrypted key messages.
+4. Every accepted message carries the **membership version and recipient-device snapshot resolved at send time**. A member added later cannot receive old ciphertext, and a removed member cannot receive new ciphertext merely because the asynchronous worker read a newer cache entry.
+
+##### 2. Device Connect, Reconnect, and Disconnect
+
+```mermaid
+sequenceDiagram
+    participant D as Device (clientId)
+    participant G as API Gateway
+    participant WS as Connection Service
+    participant R as Redis Connection Registry
+    participant I as Inbox Service
+    participant S as Messaging Service
+    participant PG as PostgreSQL
+
+    D->>G: WebSocket upgrade + JWT
+    G->>WS: Route authenticated socket
+    WS->>R: ZADD conn:{userId} expiresAt clientId|serverId|connId
+    Note over WS: Register before backfill - live pushes can now arrive
+    D->>I: GET /v1/inbox?before=cursor
+    I-->>D: Device's unread Inbox entries
+    D->>S: ACK each received message
+    S->>R: Mark device receipt and remove from inbox:{clientId}
+    D->>WS: HEARTBEAT every 30 seconds
+    Note over WS: Heartbeat answered in-process - no Redis write
+    WS->>R: Every 60s, pipelined ZADD XX for all local endpoints, expiry now + 120 seconds
+    D-->>WS: Clean close
+    WS->>R: ZREM this endpoint only
+    WS->>PG: Update last_seen only if no live endpoint remains
+```
+
+1. The gateway validates the WebSocket upgrade; the Connection Service creates a unique `connId` and registers `clientId → serverId + connId` in the user’s Redis sorted set.
+2. Registration occurs **before** Inbox sync. A message that arrives during sync can therefore be pushed live; the client deduplicates by `messageId` if it also appears in the Inbox page.
+3. Every device has its own `inbox:{clientId}` and acknowledgement state. A phone ACK never deletes a laptop’s pending message.
+4. Heartbeats are a pod-local liveness check; the registry is refreshed separately, every 60s per pod in one pipelined batch (~2.5M `ZADD`/s cluster-wide). A clean close removes just that endpoint with `ZREM`, and a device that misses two heartbeats is closed and removed the same way. If the pod itself crashes, its endpoints stop being refreshed, become unroutable within 120 seconds, and are eventually swept from the sorted set. The user is offline only when no live endpoint remains.
+
+##### 3. Send a Message: Durable Record, Then Real-Time Delivery
+
+```mermaid
+sequenceDiagram
+    participant A as Alice's device
+    participant WS as Connection Service
+    participant MS as Messaging Service
+    participant CASS as Cassandra
+    participant K as Kafka
+    participant R as Redis Registry
+    participant BWS as Recipient Connection Services
+    participant B as Recipient devices
+
+    A->>WS: SEND_MESSAGE {chatId, ciphertext}
+    WS->>MS: gRPC request + sender identity
+    MS->>MS: Validate membership and resolve recipient snapshot
+    MS->>CASS: Persist ciphertext + durable fan-out intent (outbox row)
+    MS->>K: Produce message-fanout (acks=all, key=chatId, recipient snapshot)
+    MS->>R: Read live recipient endpoints
+    MS->>BWS: Redis Stream batches grouped by serverId
+    BWS->>B: NEW_MESSAGE {messageId, ciphertext}
+    MS-->>A: SENT {messageId}
+    Note over K: Durable fan-out continues independently
+```
+
+1. Alice’s device sends ciphertext; the Connection Service forwards it to the Messaging Service over gRPC.
+2. The Messaging Service validates Alice against the cached membership version, resolves the recipients and their target Client IDs, and assigns `messageId` plus server timestamp.
+3. It persists the ciphertext and a **durable fan-out intent** (outbox row) in Cassandra, produces to `message-fanout` with `acks=all`, and only then acknowledges `SENT`. If Kafka is degraded (producer breaker open), it acks `SENT` as soon as the outbox intent is durable and lets the relay publish when Kafka recovers ([§6.3](#63-cascading-failure)). The publisher is retry-safe: if it crashes after persistence but before Kafka confirms the event, an outbox relay republishes the same `messageId`; downstream writes are idempotent.
+4. In parallel, it looks up currently live endpoints in Redis, groups them by `serverId`, and writes one Redis Stream batch per destination Connection Service. Those pods push `NEW_MESSAGE` over the already-open sockets.
+5. Real-time push is an optimization, not the delivery guarantee. The Kafka path below makes every target device eventually catch up.
+
+##### 4. Durable Fan-Out and Offline Catch-Up
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka message-fanout
+    participant F as Fan-out Worker
+    participant R as Redis
+    participant I as inbox:{clientId}
+    participant N as Notification Worker
+    participant D as Offline device
+
+    K->>F: Consume event ordered by chatId
+    F->>F: Use captured recipient-device snapshot
+    loop Every target clientId
+        F->>I: ZADD messageId with timestamp score
+        F->>R: Check conn:{userId} for this client endpoint
+    end
+    F->>N: Emit notification for users with no live endpoint
+    Note over F: Commit Kafka offset only after idempotent Inbox writes
+    D->>R: Later: register live endpoint on reconnect
+    D->>I: GET /v1/inbox (cursor pagination)
+    I-->>D: Messages missed while offline
+    D->>I: ACK → ZREM only from this device's Inbox
+```
+
+1. Kafka preserves message order per `chatId`; the Fan-out Worker uses the recipient snapshot captured when the message was accepted, rather than rereading potentially changed group membership.
+2. It writes the message into each existing recipient device’s `inbox:{clientId}`. The idempotency key is `messageId + clientId`, so replay after a worker crash is safe.
+3. An online device may receive the message twice (immediate WebSocket push plus later Inbox sync). Clients deduplicate by `messageId`.
+4. If a user has no active endpoint, the worker emits one notification event. The Notification Worker sends APNs/FCM as a wake-up signal only; the actual ciphertext stays in the device Inbox.
+5. On reconnect, a device reads its own paginated Inbox and ACKs each item. An ACK removes only that device’s copy; it never deprives another linked device of sync.
+
+##### 5. Delivery and Read Receipts
+
+```mermaid
+sequenceDiagram
+    participant B as Bob's phone
+    participant S as Messaging Service
+    participant R as Redis MessageStatus
+    participant A as Alice (sender)
+
+    B->>S: ACK {messageId}
+    S->>R: HSET status:{messageId} bob-phone DELIVERED
+    S->>R: HSET recipient-status:{messageId} u-bob DELIVERED
+    S->>A: MESSAGE_ACK {messageId, bob, delivered}
+    B->>S: READ {messageId}
+    S->>R: HSET status:{messageId} bob-phone READ
+    S->>R: HSET recipient-status:{messageId} u-bob READ
+    S->>A: MESSAGE_ACK {messageId, bob, read}
+    Note over A: If offline, Alice syncs current state later
+```
+
+1. Device-level `MessageStatus` records preserve independent phone/laptop sync state. A sender-visible receipt is then aggregated **per recipient user** — in this design, the first verified device ACK marks that user delivered/read, while other devices still retain their own Inbox entries until they sync.
+2. In a group, only the original sender receives each participant’s aggregate receipt. Broadcasting Bob’s read event to all 199 other members would create a secondary O(N²) receipt fan-out storm.
+3. If the sender is offline, the per-device state stays in `MessageStatus` and the per-user aggregate in `RecipientMessageStatus`. On reconnect, each of the sender's devices sends `SYNC_SENT_STATUS` (REST: `GET /v1/sync/status?since={timestamp}`) with its own receipt-sync cursor and receives the current state from both hashes. No receipt transition log is required for the core product behavior.
+
+:::staff[The invariant that keeps asynchronous chat correct]
+The message’s recipient membership/device snapshot is fixed **before** fan-out begins; its ciphertext and fan-out intent are durable **before** `SENT` is acknowledged; every downstream write is idempotent by `messageId + clientId`; and every client deduplicates by `messageId`. Those four rules make retries, delayed Kafka delivery, reconnects, and concurrent membership changes safe without requiring a distributed transaction across Cassandra, Kafka, Redis, and WebSocket servers.
+:::
+
+### 5.11 Observability
 
 See [Observability](/foundations/observability) for the generic framework (metric layers, USE/RED, SLOs, burn-rate alerting, tracing, cardinality control). This section applies it to the final architecture above.
 
@@ -758,11 +1203,11 @@ See [Observability](/foundations/observability) for the generic framework (metri
 | | File descriptor usage per pod | One socket = one fd; exhaustion silently rejects new connections | Page > 90% of ulimit |
 | | Heap usage + GC pause p99 (Connection Service) | ~50KB/connection; long pauses stall heartbeats → mass false disconnects + presence flapping | Warn GC p99 > 200ms |
 | | Pod restarts / OOMKills | Each restart = ~640K reconnects ([§6.1](#61-thundering-herd-on-deploy)) | Ticket on any OOMKill; page on repeated restarts across the fleet |
-| **Dependencies (DB / Cache / Queue)** | Redis Streams pending entries + lag per server stream | Real-time path backlog for one Chat Server; a stuck consumer = all its users stop receiving | Page if any stream lag > 5s |
+| **Dependencies (DB / Cache / Queue)** | Redis Streams pending entries + lag per server stream | Real-time path backlog for one Connection Service pod; a stuck consumer = all its users stop receiving | Page if any stream lag > 5s |
 | | Kafka consumer lag — `message-fanout`, per partition | Inbox durability backstop falling behind; per-partition view isolates hot chats | Warn > 10s, page > 60s ([§6.3](#63-cascading-failure)) |
 | | Kafka consumer lag — `notifications` | Offline users aren't being woken | Ticket > 5 min |
 | | Cassandra p99 write latency + dropped mutations / unavailable errors | Message persistence on the send path at LOCAL_QUORUM | Warn p99 > 20ms; page on unavailable errors |
-| | Cassandra pending compactions + tombstones scanned per read | TWCS health — growth means deletes are fighting compaction | Ticket |
+| | Cassandra pending compactions + tombstones scanned per read | TWCS health — rows should only leave via TTL; tombstone growth means per-row deletes or out-of-window writes crept in | Ticket |
 | | Redis memory used + evictions (Inbox shards) | Evicted Inbox entries force the slow Cassandra fallback ([§6.5](#65-component-failure-summary)) | Warn > 75% memory; page on any Inbox eviction |
 | | Redis p99 latency + pool saturation, **per pool** (Registry vs Inbox) | Verifies the bulkhead — Inbox pressure must not starve routing | Warn p99 > 5ms |
 | | ChatParticipants cache hit ratio | Expected > 99.9%; a drop means PostgreSQL stampede on every send | Warn &lt; 99% |
@@ -876,7 +1321,9 @@ Connection Service → Messaging Service (slow)
 
 Messaging Service → Kafka (producer backs up)
   ├── Kafka absorbs: this is what Kafka is for
-  ├── Async produce: don't wait for Kafka ACK before responding
+  ├── Normal path: SENT only after outbox row in Cassandra + Kafka acks=all
+  ├── Degraded mode (producer breaker open): ack SENT once the outbox intent
+  │   is durable in Cassandra; the outbox relay publishes when Kafka recovers
   └── Producer backpressure: bounded in-flight requests
 
 Kafka → Fan-out Worker (consumer lag grows)
@@ -922,8 +1369,8 @@ Fan-out Worker → Redis (slow)
 
 | Component | Failure | Impact | Recovery |
 |-----------|---------|--------|----------|
-| **Connection Service pod** | Pod crash | ~640K users disconnect | Client reconnect with jitter; Registry TTL cleans stale entries in 60s |
-| **Redis (Connection Registry)** | Shard down | Can't route to affected users | Auto-failover to replica (~seconds); queue in Kafka during window |
+| **Connection Service pod** | Pod crash | ~640K users disconnect | Client reconnect with jitter; the dead pod's registry entries stop being refreshed and expire within 120s |
+| **Redis (Connection Registry)** | Shard down | Can't route to affected users | Replica promotion (~seconds). During that window the real-time push is skipped for affected users; the durable Kafka → Inbox path still delivers, and devices pick messages up on their next Inbox sync/reconnect. Broadcast fallback is infeasible at ~2.3M msg/s × ~235 pods |
 | **Redis (Inbox)** | Shard down | Can't write/read Inbox for affected users | Auto-failover; fallback: rebuild from Cassandra Message table |
 | **Cassandra** | Node down | Message persistence fails for affected partitions | RF=3 + LOCAL_QUORUM survives 1 failure; hinted handoff replays |
 | **Kafka broker** | Broker down | Fan-out stalled for affected partitions | Leader election to surviving broker (~seconds); real-time path unaffected |
@@ -942,6 +1389,9 @@ Fan-out Worker → Redis (slow)
 | Fan-out pipeline | Kafka (partitioned by chatId) | Redis Streams only / Direct writes | Kafka adds ~30ms but gives durability, ordering, replay, backpressure |
 | Two messaging layers | Redis Streams (real-time) + Kafka (durable) | Single layer | Operational complexity for optimal latency AND durability |
 | Message store | Cassandra | PostgreSQL / DynamoDB | Eventual consistency for massive write throughput; single-partition reads by chatId |
+| Message deletion | Logical delete on ACK + 30-day row TTL + TWCS | Per-row `DELETE` on ACK | No tombstones (whole SSTables dropped); delivered ciphertext lingers until TTL |
+| Registry liveness | Pod-local heartbeats + pipelined 60s refresh, 120s expiry | Registry write on every 30s heartbeat | ~2.5M vs ~5M writes/s; crash staleness grows to ≤120s |
+| `SENT` semantics | Ack after outbox row + Kafka `acks=all` (outbox-only in degraded mode) | Ack after Inbox writes / fire-and-forget produce | One extra Kafka round trip on the send path; never acks a message that can't be fanned out |
 | Inbox / MessageStatus | Redis | Cassandra | Memory-bound for clean deletes without tombstones; Cassandra as durability backstop |
 | User/Chat metadata | PostgreSQL + Redis cache | Full NoSQL | Relational joins and strong consistency for small, stable datasets |
 | Observability cardinality | Bounded-label metrics + exemplars + tail-sampled traces | Per-user / per-chat metric labels | Can't graph a single user's latency; per-user debugging relies on traces/logs by messageId |
@@ -975,6 +1425,13 @@ Fan-out Worker → Redis (slow)
 - [Observability](/foundations/observability) — metric layers (USE/RED), SLIs/SLOs, burn-rate alerting, tracing, cardinality control
 
 ## Appendix: Scale Assumptions
+
+<StatGrid stats={[
+  {value: '500M', label: 'Daily active users', accent: 'blue'},
+  {value: '100B', label: 'Messages / day', accent: 'purple'},
+  {value: '~2.3M/s', label: 'Peak send QPS', detail: '2x the ~1.16M/s average', accent: 'green'},
+  {value: '~20 TB', label: 'New message data / day', detail: '100B × 200 bytes', accent: 'amber'},
+]} />
 
 | Metric | Value |
 |--------|-------|

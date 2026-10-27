@@ -5,8 +5,10 @@ description: >
   joined through the cross-region counter-delta topic. Hot path: every request
   is evaluated in-process against a local rule cache and local counters (~0.12ms)
   and either forwarded upstream or rejected with 429 + Retry-After /
-  X-RateLimit-* headers. Background: gateway pods flush counter deltas to the
-  Sync Service every 500ms, which INCRBYs them into the Redis Cluster and
+  X-RateLimit-* headers. Background: each gateway pod's sync thread flushes
+  counter deltas to the regional Redis Cluster every 500ms (pipelined INCRBY +
+  GET, no Lua). Vetora does not allow ApiGateway -> Cache edges, so that flush
+  is drawn through the Sync Service node; in the design the Sync Service only
   publishes the region's deltas for the other regions (2s, ~10% bounded
   overshoot). Cold path: admins manage rules through the Rule Service
   (PostgreSQL), which refreshes the Redis rule cache and publishes
@@ -77,8 +79,11 @@ components:
           - { name: apiKey, field_type: string, required: true, description: "Caller identity used as the rate-limit key" }
           - { name: cursor, field_type: string, required: false, description: "Pagination cursor" }
 
-  # One per region. Redis sees ~100 ops/s per hot key (50 pods × 2 flushes/s)
-  # instead of one write per request, which is why hot keys need no sharding.
+  # One per region. Redis sees ~100 pipelined round-trips/s per hot key
+  # (50 pods × 2 flushes/s = 200 commands/s) instead of one write per request,
+  # which is why hot keys need no sharding. Modeling note: the gateway sync
+  # thread's flush is routed through this node (ApiGateway -> Cache is not a
+  # legal Vetora edge); in the design this service only does cross-region sync.
   sync_service:
     type: Service
     position: { x: 760, y: 400 }
@@ -93,7 +98,7 @@ components:
         method: POST
         path: /internal/v1/counters/sync
         summary: "Flush a gateway pod's counter deltas (every 500ms)"
-        description: "Batched INCRBY of accumulated local deltas into Redis via a Lua script (atomic), returns global counts so the pod can correct its local counters, and publishes the region's deltas for cross-region merge. Sync intervals are jittered across pods so they don't all flush together."
+        description: "Models the gateway sync thread's flush: one pipelined round-trip per dirty key (INCRBY current window, GET previous window; EXPIRE key 120 NX on first flush). No Lua needed for sliding window. Returns global counts so the pod can recompute its local allowance. Sync intervals are jittered across pods so they don't all flush together."
         requestBody:
           - { name: podId, field_type: string, required: true, description: "Gateway pod id" }
           - { name: windowId, field_type: number, required: true, description: "floor(now / windowSeconds)" }
@@ -176,7 +181,7 @@ components:
           - { name: updated_at, field_type: string, required: true, description: "Last modification timestamp" }
 
   # Redis Cluster: 3 primaries + 3 replicas. Counter working set ≈ 100M keys ×
-  # 128B ≈ 12.8 GB (~4.3 GB/shard). Sized above the working set on purpose:
+  # ~120B ≈ 12 GB (~4 GB/shard). Sized above the working set on purpose:
   # an evicted counter silently resets a client's quota.
   redis:
     type: Cache
@@ -190,10 +195,10 @@ components:
     cacheSpaces:
       - id: cs_counters
         name: "Global Counters"
-        keyPattern: "rl:{ruleId}:{identityValue}:{windowId}"
-        defaultTtlSeconds: 60
+        keyPattern: "rl:{<ruleId>:<identityValue>}:<windowId>"
+        defaultTtlSeconds: 120
         valueFields:
-          - { name: count, field_type: number, required: true, description: "Requests in this window (TTL = windowSeconds, self-cleaning)" }
+          - { name: count, field_type: number, required: true, description: "Requests in this window. TTL = 2 × windowSeconds so the previous window stays readable for the sliding-window estimate. {ruleId:identityValue} is a Redis Cluster hash tag: current and previous window share a slot." }
       - id: cs_remote_counts
         name: "Remote Region Counts"
         keyPattern: "rl:remote:{region}:{ruleId}:{identityValue}:{windowId}"
@@ -228,7 +233,7 @@ components:
         partitionKey: counterKey
         schema:
           - { name: region, field_type: string, required: true, description: "Originating region (us-east | us-west | eu)" }
-          - { name: counterKey, field_type: string, required: true, description: "rl:{ruleId}:{identityValue}:{windowId} (partition key)" }
+          - { name: counterKey, field_type: string, required: true, description: "rl:{<ruleId>:<identityValue>}:<windowId> (partition key)" }
           - { name: count, field_type: number, required: true, description: "Region's current count for the window" }
           - { name: windowId, field_type: number, required: true, description: "floor(now / windowSeconds)" }
 
@@ -302,7 +307,7 @@ edges:
     edge_type: CACHE_CALL
     contract_id: cs_counters
     operation: SET
-    label: "Lua INCRBY batch"
+    label: "Pipelined INCRBY (gateway flush)"
     source_handle: source-bottom-2
     target_handle: target-top-1
     latency_ms: 2

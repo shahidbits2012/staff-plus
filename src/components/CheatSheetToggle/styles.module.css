@@ -1,0 +1,38 @@
+.host {
+  margin: 0.5rem 0 2rem;
+}
+
+.switch {
+  display: inline-flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  border: 1px solid var(--vt-border);
+  border-radius: 999px;
+  background: var(--vt-surface);
+}
+
+.option {
+  padding: 0.4rem 1rem;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--vt-text-secondary);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 120ms, color 120ms;
+}
+
+.option:hover {
+  color: var(--vt-text);
+}
+
+.active {
+  background: color-mix(in srgb, var(--vt-blue) 16%, transparent);
+  color: var(--vt-blue);
+}
+
+.sheet {
+  margin-top: 1.5rem;
+}

@@ -46,7 +46,7 @@ HGET user:123 name → "Alice"
 HGETALL user:123 → {name: "Alice", status: "online", lastSeen: "1696591234"}
 ```
 
-**Use for:** Object caching, session storage, connection registry (`conn:{userId}` → set of server:connection pairs), message status tracking.
+**Use for:** Object caching, session storage, a simple single-device connection registry (`conn:{userId}` → device → server:connection; one key-level TTL covers the whole hash, so for multi-device use the sorted-set form below), message status tracking.
 
 **Why not just serialize JSON into a String?** Hashes let you read/update individual fields without deserializing the whole object. `HSET user:123 status "offline"` is O(1) — no read-modify-write cycle.
 
@@ -61,7 +61,15 @@ ZRANGEBYSCORE inbox:user456 -inf +inf      // get all, ordered by timestamp
 ZREM inbox:user456 "msg-abc"               // clean delete, no tombstones
 ```
 
-**Use for:** Leaderboards, priority queues, time-ordered collections (Inbox!), rate limiting windows, trending/ranking.
+**Use for:** Leaderboards, priority queues, time-ordered collections (Inbox!), rate limiting windows, trending/ranking, and the recommended **multi-device connection registry** — member `{clientId}|{serverId}|{connId}`, score = per-endpoint `expiresAt`, so each connection expires independently:
+
+```
+ZADD conn:alice 1739941260000 "phone|ws-042|c-a1"     // score = expiresAt, refreshed by the gateway
+ZRANGEBYSCORE conn:alice (1739941200000 +inf          // live endpoints only (score > now)
+ZREMRANGEBYSCORE conn:alice -inf 1739941200000        // sweep expired endpoints
+```
+
+See [WebSocket Connection Management](/building-blocks/websocket-connection-management#redis-cluster-implementation).
 
 **Key advantage over Cassandra for queue-like patterns:** Deletes are clean — the member is removed from the skip list. No tombstones, no compaction overhead.
 
@@ -94,9 +102,9 @@ SMEMBERS chat:123:members → ["user-A", "user-B", "user-C"]
 Append-only log with consumer groups. Redis's answer to Kafka for lightweight streaming.
 
 ```
-XADD stream:cs-182 * chatId "chat-123" content "hello" recipients "userB,userD"
-XREAD COUNT 10 BLOCK 5000 STREAMS stream:cs-182 $     // read new entries, block up to 5s
-XACK stream:cs-182 consumer-group msg-id               // acknowledge processing
+XADD stream:cs-182 MAXLEN ~ 100000 * chatId "chat-123" content "hello" recipients "userB,userD"
+XREADGROUP GROUP cg-cs-182 cs-182 COUNT 10 BLOCK 5000 STREAMS stream:cs-182 >   // new entries, block up to 5s
+XACK stream:cs-182 cg-cs-182 msg-id                    // acknowledge processing (needs a consumer group)
 ```
 
 **Use for:** Event streaming, server-to-server message passing, change data capture, activity feeds.

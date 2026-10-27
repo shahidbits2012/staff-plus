@@ -3,16 +3,22 @@ sidebar_position: 1
 title: Distributed Rate Limiter
 ---
 
+import CheatSheet from '@site/src/cheatsheets/rate-limiter';
+
 # Distributed Rate Limiter
 
 Design a distributed rate limiting service that enforces request quotas across a multi-region fleet.
+
+<CheatSheetToggle>
+  <CheatSheet />
+</CheatSheetToggle>
 
 ## 1. Requirements
 
 ### Functional Requirements
 1. **FR1**: Admin should be able to create and manage rate limiting rules based on different identities — IP address, API key, client key, caller service, etc.
 2. **FR2**: On every API request, rate limiting should be evaluated and enforced
-3. **FR3**: For throttled requests, return informational headers — `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+3. **FR3**: Return informational headers — `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` on every response, plus `Retry-After` on throttled (429) responses
 
 ### Non-Functional Requirements (LSDARO)
 1. **NFR1 — Latency**: Rate limit evaluation must complete in &lt; 10ms (inline on every request)
@@ -55,6 +61,7 @@ DELETE /v1/rules/:ruleId        → delete a rule
 ```json
 {
   "identityType": "api_key",
+  "resource": "/api/v1/orders",
   "limit": 100,
   "windowSeconds": 60,
   "algorithm": "sliding_window",
@@ -124,25 +131,27 @@ The real choice here is about who owns the hot path. A dedicated limiter service
 | id | UUID | Primary key | `rule-001` |
 | name | string | Human-readable label | `"API key — 100/min"` |
 | identityType | enum | `ip` / `api_key` / `client_key` / `service` | `api_key` |
+| resource | string | Route / path the rule applies to; matched against `resource` in `POST /v1/check` | `/api/v1/orders` |
 | limit | int | Max requests allowed per window | `100` |
 | windowSeconds | int | Time window duration | `60` |
 | algorithm | enum | `fixed_window` / `sliding_window` / `token_bucket` | `sliding_window` |
 | action | enum | `reject` / `throttle` | `reject` |
+| version | int | Server-managed, incremented on every update; carried in the `rules:changed` payload so pods drop stale or duplicate events | `7` |
 | createdAt | timestamp | Rule creation time | `2024-10-01T09:00:00Z` |
 | updatedAt | timestamp | Last modification time | `2024-10-11T08:30:00Z` |
 
-**Counter** (Redis — ephemeral, one key per rule × client × window; TTL = windowSeconds, self-cleaning)
+**Counter** (Redis — ephemeral, one key per rule × client × window; TTL = 2 × windowSeconds, self-cleaning)
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| key | string | `rl:{ruleId}:{identityValue}:{windowId}` | `rl:rule-001:sk-abc123:28284218` |
-| value | int | Request count in current window | `42` |
-| TTL | int | Auto-expires with the window | `60` |
+| key | string | `rl:{<ruleId>:<identityValue>}:<windowId>` | `rl:{rule-001:sk-abc123}:28284218` |
+| value | int | Request count in the window | `42` |
+| TTL | int | 2 × windowSeconds, so the previous window's key is still readable for the sliding-window estimate | `120` |
 
 - **Rule cache** in Redis — hot-path reads; refreshed on rule change via pub/sub invalidation
 
 :::note Counter key design
-`windowId` = `floor(now_epoch / windowSeconds)`. For a 60s window, all requests in the same minute hash to the same key. The key auto-expires via Redis TTL — no cleanup job needed.
+`windowId` = `floor(now_epoch / windowSeconds)`. For a 60s window, all requests in the same minute hit the same key. The braces are a literal Redis Cluster [hash tag](/building-blocks/redis): only `<ruleId>:<identityValue>` is hashed, so the current and previous window keys of one client share a slot (one pipelined round-trip), while different clients still spread across slots. The key auto-expires via Redis TTL — no cleanup job needed.
 :::
 
 ### Architecture
@@ -183,10 +192,10 @@ graph LR
 **FR2: Rate limiting on every request** — API Gateway plugin intercepts every inbound request before routing to the backend:
 1. Extract identity (IP, API key, etc.) from the request
 2. Look up matching Rule from Redis cache (~0.5ms)
-3. Build counter key: `rl:{ruleId}:{identityValue}:{windowId}`
-4. Execute atomic `INCR` + `PTTL` on the counter key in Redis (~1ms)
+3. Build counter key: `rl:{<ruleId>:<identityValue>}:<windowId>`
+4. Pipeline `INCRBY key 1` + `EXPIRE key <ttl> NX` on the counter key in Redis (~1ms). `INCRBY` is atomic; `EXPIRE ... NX` (Redis 7+) sets the TTL only if the key has none, so it is idempotent and safe to send on every call
 5. If count &lt;= limit → allow; if count > limit → reject with 429
-6. On first INCR (key doesn't exist), set TTL = windowSeconds
+6. TTL = 2 × windowSeconds, so the previous window's key outlives its window for the sliding-window read
 
 **FR3: Return rate limit headers** — Every response (200 or 429) includes headers computed from the INCR result:
 - `X-RateLimit-Limit` = rule.limit
@@ -201,7 +210,7 @@ See [Rate Limiting Algorithms](/patterns/rate-limiting) for the full breakdown �
 | Algorithm | Memory | Accuracy | Burst Handling | Redis Cost | Fit for 1M rps |
 |-----------|--------|----------|---------------|------------|-----------------|
 | Fixed Window | O(1) | Poor (boundary burst) | 2× burst at edges | 1 INCR | Scales, but inaccurate |
-| **Sliding Window Counter** | **O(1)** | **Good (~1-2% off)** | **Smoothed boundaries** | **1 GET + 1 INCR** | **Best default** |
+| **Sliding Window Counter** | **O(1)** | **Good (~1-2% off)** | **Smoothed boundaries** | **1 GET + 1 INCR (pipelined, no Lua)** | **Best default** |
 | Sliding Window Log | O(N) | Perfect | No bursts | ZADD + ZREM + ZCARD | Memory explodes |
 | Leaky Bucket | O(1) | Perfect | Queues (shaper) | Lua script | Wrong model for gating |
 | **Token Bucket** | **O(1)** | **Good** | **Controlled bursts** | **Lua script** | **Best if bursts needed** |
@@ -213,7 +222,7 @@ See [Rate Limiting Algorithms](/patterns/rate-limiting) for the full breakdown �
 - **Rejected:** Fixed Window (boundary burst), Leaky Bucket (shaper, not a limiter), Sliding Log (O(N) memory at scale).
 
 :::note Atomicity
-Both algorithms require **atomic read-modify-write** in Redis. Use a Lua script (single-threaded on Redis server) to avoid race conditions across concurrent gateway instances.
+**Sliding Window Counter needs no Lua.** `INCRBY` on the current window key is atomic on its own, the previous window is a read-only `GET`, and the weighted estimate is computed in the gateway. **Token Bucket needs Lua**: refill-then-take is a read-modify-write on the bucket state, so it runs as a Lua script (single-threaded on the Redis server) to avoid race conditions across concurrent gateway instances.
 :::
 
 :::note
@@ -232,11 +241,11 @@ This HLD is intentionally minimal — single Redis, single region. The deep dive
 |----------|-----|---------|----------|
 | **Redis only** | Every request does INCR in Redis | ~1-2ms (intra-AZ) | Perfect — single global counter |
 | **Local only** | In-process `ConcurrentHashMap` in each gateway | ~0.1ms | Poor — each pod sees 1/Nth of traffic |
-| **Hybrid (local + periodic sync)** | Local counter serves every request; background thread syncs delta to Redis every 500ms-1s | ~0.1ms hot path | Good — ~0.8-1.6% overshoot during sync interval |
+| **Hybrid (local + periodic sync)** | Local counter serves every request; background thread syncs delta to Redis every 500ms-1s | ~0.1ms hot path | Good — typical ~0.8% overshoot; worst case up to 2× limit for one sync cycle (see math below) |
 
 #### Decision: Hybrid — local counters with periodic Redis sync
 
-The gateway process maintains an in-process `ConcurrentHashMap<String, AtomicLong>` — zero network hop on the hot path. A background thread syncs accumulated deltas to Redis every 500ms.
+The gateway process maintains an in-process `ConcurrentHashMap<String, AtomicLong>` — zero network hop on the hot path. A background thread in the gateway plugin syncs accumulated deltas to the regional Redis every 500ms (jittered per pod). The Sync Service is not involved here; it only handles cross-region exchange ([§5.2](#52-multi-region-accuracy)).
 
 **How it works:**
 
@@ -248,17 +257,18 @@ Hot path (per request, ~0.1ms):
   4. If localCount > threshold → reject (429)
   5. Return allow + headers
 
-Background sync (every 500ms):
-  1. For each dirty counter: INCRBY key delta (batched pipeline)
-  2. GET global count from Redis
-  3. Update local counter to reflect global state
-  4. Reset delta accumulator
+Background sync (gateway thread, every 500ms, jittered):
+  1. For each dirty counter, one pipelined round-trip (same slot via hash tag):
+       INCRBY rl:{rule-001:sk-abc123}:<curr> delta   → new global count
+       GET    rl:{rule-001:sk-abc123}:<prev>         → previous window (read-only)
+     (first flush of a window key also sends EXPIRE key 120 NX)
+  2. Update local counter to reflect global state
+  3. Reset delta accumulator
 ```
 
 **Overshoot math:** With 50 gateway pods and 500ms sync interval on a 60s window with limit=1000:
-- Each pod can admit up to `1000/50 = 20` requests between syncs
-- 50 pods × 20 = 1000 admitted before sync corrects → exactly at limit
-- Worst case: all pods sync at the same time and each admits 20 more → 1000 overshoot (2× limit for one sync cycle). Mitigated by jittering sync intervals across pods.
+- **Typical (steady traffic spread across pods):** error ≈ unsynced admits per interval = pods × per-pod rate × sync interval = `50 × (1000 / 60s / 50) × 0.5s ≈ 8 requests ≈ 0.8%` of the limit.
+- **Worst case (all pods burst simultaneously within one 500ms sync interval):** each pod can admit up to `1000/50 = 20` requests between syncs, so 50 pods × 20 = 1000 are admitted before sync corrects (exactly at limit). If all pods sync at the same time and each admits 20 more before the corrected count lands → 1000 overshoot, i.e. **up to 2× the limit for one sync cycle**. Mitigated by jittering sync intervals across pods.
 
 **Pod restart:** local counters reset to 0. On startup, pre-warm by fetching active counters from Redis for this pod's key space.
 
@@ -269,25 +279,27 @@ We give up exact enforcement on purpose. Overshoot is bounded by (pods × reques
 #### Redis Memory Calculation
 
 ```
-Key:    "rl:rule-001:sk-abc123:28284218"  → ~40 bytes
+Key:    "rl:{rule-001:sk-abc123}:28284218" → 32 bytes
 Value:  integer counter                    → 8 bytes
-Redis overhead per key (dictEntry+SDS):    → ~80 bytes
-                                           ≈ 128 bytes/key
+Redis overhead per key                     → ~80 bytes
+  (dictEntry + robj + SDS header + expires entry, allocator rounding)
+                                           ≈ 120 bytes/key
+  (with a full 36-char UUID ruleId the key is ~60 bytes → ~148 bytes/key)
 
-Unique keys = clients × rules × 2 (current + previous window)
+Unique keys = clients × rules × 2 (current + previous window, both alive: TTL = 2 × window)
 Example: 10M clients × 5 rules × 2 = 100M keys
-Memory: 100M × 128 bytes ≈ 12.8 GB
+Memory: 100M × 120 bytes ≈ 12 GB
 
 Redis Cluster: 3 primaries × 1 replica = 6 nodes
-  ~4.3 GB per primary shard (fits in 8-16 GB nodes)
+  ~4 GB per primary shard (fits in 8-16 GB nodes)
 ```
 
 :::staff[Memory sizing: an evicted counter silently resets a quota]
-In a cache, an eviction costs you a miss. Here it hands that client a fresh quota, and nothing errors or logs it. So we size for peak key count with ~50% headroom (8-16 GB nodes for ~4.3 GB of data) and set `maxmemory-policy noeviction`. Then memory pressure shows up as failed writes, which trip the circuit breaker and page someone, instead of silent under-enforcement. `evicted_keys` must stay at 0, and "memory vs maxmemory" is a capacity alert, not a dashboard curiosity. Revisit the shard count when key cardinality grows (new identity types or rules multiply keys) rather than waiting for evictions.
+In a cache, an eviction costs you a miss. Here it hands that client a fresh quota, and nothing errors or logs it. So we size for peak key count with ~50% headroom (8-16 GB nodes for ~4 GB of data) and set `maxmemory-policy noeviction`. Then memory pressure shows up as failed writes, which trip the circuit breaker and page someone, instead of silent under-enforcement. `evicted_keys` must stay at 0, and "memory vs maxmemory" is a capacity alert, not a dashboard curiosity. Revisit the shard count when key cardinality grows (new identity types or rules multiply keys) rather than waiting for evictions.
 :::
 
 :::staff[Hot keys: solved by design, not by sharding]
-The hybrid approach **already solves hot keys.** Each pod accumulates locally and syncs delta every 500ms. With 50 pods, Redis sees 50 × 2 = 100 ops/sec per key, not 100K. No sub-sharding needed unless you have thousands of pods. The point: write load on Redis grows with pod count × sync frequency, not with request rate. One design choice removes a whole class of bottleneck.
+The hybrid approach **already solves hot keys.** Each pod accumulates locally and syncs delta every 500ms. With 50 pods, Redis sees 50 × 2 = 100 pipelined round-trips/sec per key (200 commands/sec: `INCRBY` + `GET`), not 100K. No sub-sharding needed unless you have thousands of pods. The point: write load on Redis grows with pod count × sync frequency, not with request rate. One design choice removes a whole class of bottleneck.
 :::
 
 ### 5.2 Multi-Region Accuracy
@@ -315,7 +327,7 @@ Region US-West:  local_count = 350
 Region EU:       local_count = 200
 
 Sync (every 2s):
-  Each region publishes its delta to a cross-region Kafka topic
+  Each region publishes its delta to a cross-region Kafka topic (rl-counter-deltas)
   Each region consumes others' deltas
   Global estimate = sum of all regional counts = 950
 
@@ -364,6 +376,8 @@ Redis recovers:
   → Local counters re-warm from Redis global state
 ```
 
+**Bulkhead the Redis clients.** Each gateway keeps separate Redis connection pools for counter sync and for rule pub/sub + rule-cache reads ([Bulkhead](/patterns/bulkhead)), so a saturated or timing-out counter path can't starve rule updates, and the breaker trips on the counter pool alone.
+
 **Why permissive, not conservative?**
 
 | Mode | Each pod enforces | Total admitted (50 pods) | Risk |
@@ -411,7 +425,7 @@ Cold start:
   - No dependency on cache state at startup
 ```
 
-**Why not polling?** Rules change ~1-10 times per day. Polling every 30s means 99.97% of polls return "no change." Pub/sub is event-driven — zero cost when nothing changes, instant when something does.
+**Why not polling?** Rules change ~1-10 times per day. 50 gateways polling every 30s = 144K polls/day, and each change is picked up once per gateway, so only 50-500 polls/day return anything: ~99.97% of polls return "no change" at ~1 change/day, ~99.65% at 10/day. Pub/sub is event-driven — zero cost when nothing changes, instant when something does.
 
 :::staff[Rule propagation: fast path + correctness bound + bootstrap]
 Each mechanism covers a gap the others leave. Pub/sub makes propagation fast but can drop messages. The 60s TTL puts a hard ceiling on staleness without relying on delivery. The cold-start load reads from the source of truth (Rule Service backed by PostgreSQL), so a new pod never starts from an empty or poisoned cache. The `version` field in the payload lets pods ignore out-of-order or duplicate events and makes version skew across pods measurable. What we give up: up to 60s of stale enforcement in the worst case, which is acceptable for quota tuning. Revisit if rules become an incident lever ("block this tenant *now*"). Then add an acknowledged push (each pod reports its applied version) or a durable log (Kafka) instead of fire-and-forget pub/sub.
@@ -441,28 +455,31 @@ graph LR
     subgraph Data_Stores[Data Stores]
         PG[(PostgreSQL<br/>rules)]
         REDIS[(Redis Cluster<br/>counters + rule cache)]
+        K[(Kafka<br/>rl-counter-deltas<br/>cross-region)]
     end
 
     C -->|every request| GW
     GW -->|"local counter check<br/>(0.1ms)"| GW
-    GW -.->|"periodic sync<br/>(every 500ms)"| REDIS
+    GW -.->|"periodic sync, jittered<br/>INCRBY + GET (every 500ms)"| REDIS
     GW -->|allow / 429| C
 
     RS -->|CRUD| PG
     RS -->|"pub/sub invalidate"| REDIS
     GW -->|admin routes| RS
 
-    SS <-->|"cross-region<br/>counter sync (2s)"| REDIS
+    SS <-->|"regional counts"| REDIS
+    SS <-->|"cross-region<br/>deltas (2s)"| K
 ```
 
 #### Component Summary
 
 | Component | Role | Scaling |
 |-----------|------|---------|
-| **API Gateway** | Hot-path evaluation — local counter + rule cache | Stateless; scale horizontally with traffic |
+| **API Gateway** | Hot-path evaluation — local counter + rule cache; plugin background thread flushes deltas to regional Redis (500ms, jittered) | Scale horizontally with traffic; soft state (local counters) pre-warmed from Redis on start |
 | **Rule Service** | CRUD for rules; pub/sub invalidation on change | Low traffic; 2-3 pods sufficient |
-| **Sync Service** | Background sync: local→Redis (500ms), cross-region (2s) | One per region; lightweight |
-| **Redis Cluster** | Global counter store, rule cache, pub/sub channel | 3 primaries + 3 replicas; ~4.3 GB/shard |
+| **Sync Service** | Cross-region exchange only: publishes the region's deltas and merges other regions' counts (2s) | One per region; lightweight |
+| **Kafka** | Cross-region delta topic `rl-counter-deltas`, replicated to every region | Small topic; lag monitored (see [§5.6](#56-observability)) |
+| **Redis Cluster** | Global counter store, rule cache, pub/sub channel | 3 primaries + 3 replicas; ~4 GB/shard |
 | **PostgreSQL** | Durable rule storage | Single primary + read replica |
 
 #### Latency Budget
@@ -478,7 +495,7 @@ Hot path (per request):
 Background (not on hot path):
   Redis sync (every 500ms):   ~1-2ms per batch
   Cross-region sync (2s):     ~70-150ms (acceptable — async)
-  Rule pub/sub propagation:   ~1-2ms
+  Rule pub/sub propagation:   ~1-2s (async, not on request path)
 ```
 
 ### 5.6 Observability
@@ -504,7 +521,7 @@ For the generic layer model (USE / RED, SLIs/SLOs, burn-rate alerting, cardinali
 | **3. Application / Service (RED)** | Limiter decision latency p99 (in-process histogram) | Our overhead on every request (budget ~0.12ms) | p99 > 1ms (SLO burn) |
 | | Decisions/sec by outcome (allow / deny) **per rule** | Per-rule hit rate. A sudden deny spike means a bad rule or an attack | Deny rate on a rule > 3× its 1h baseline |
 | | 429 rate at the edge (absolute + % of traffic) | User-visible impact of enforcement | Spike vs baseline; **also alert if it drops to ~0 while traffic is steady** |
-| | Sync flush latency + failure rate (Sync Service → Redis Lua) | Failing flushes mean local counts drift away from the global count | Flush failures > 1% or flush p99 > 100ms |
+| | Sync flush latency + failure rate (gateway sync thread → Redis, pipelined `INCRBY` + `GET`) | Failing flushes mean local counts drift away from the global count | Flush failures > 1% or flush p99 > 100ms |
 | | Local-vs-global counter drift / overshoot % (sampled keys at window close) | Directly measures the accuracy NFR | Overshoot > 10% sustained 5 min |
 | | **Circuit-breaker state** per pod (closed / half-open / open) | **Open = fail-open = NOT enforcing.** Traffic is unlimited and nothing errors | Open > 30s on > 10% of pods → page |
 | | Rule version skew across pods + propagation delay (commit → applied) | Pods enforcing different versions of the same rule | Skew > 0 for > 60s; propagation p99 > 2s |
@@ -530,7 +547,7 @@ For the generic layer model (USE / RED, SLIs/SLOs, burn-rate alerting, cardinali
 - **Symptom-based + burn-rate on SLOs.** Page on fast burn (e.g., 14× budget over 1h), ticket on slow burn (e.g., 6× over 6h) for overhead, coverage, and availability. Causes (CPU, pool usage, Kafka lag) go on dashboards and tickets, not pages.
 - **Fail-open is silent, so alert on its absence of signal.** When the breaker opens, requests succeed and latency looks *better*. The page therefore fires on **breaker-open duration**, on the 429 rate collapsing to ~0 with steady traffic, and on the canary tenant not being throttled. Breaker open means unlimited traffic, so it pages even though users see no errors.
 - **Pages:** breaker open across the fleet, `evicted_keys` > 0, canary not throttled, availability burn. **Tickets:** drift creeping toward 10%, Kafka lag, rule version skew, Redis memory > 75%.
-- **Tracing and logs at 1M rps:** don't create a span per decision. Add `rule_id` and `decision` as attributes on the existing gateway request span (sampled). Give Sync Service flushes and the merge worker their own spans. Log denies at a sampled rate with a hashed identity, and never log allows.
+- **Tracing and logs at 1M rps:** don't create a span per decision. Add `rule_id` and `decision` as attributes on the existing gateway request span (sampled). Give gateway sync flushes and the Sync Service merge worker their own spans. Log denies at a sampled rate with a hashed identity, and never log allows.
 
 #### Deep Dive: Metric Cardinality for "Top Throttled Clients"
 
@@ -558,13 +575,13 @@ For the generic layer model (USE / RED, SLIs/SLOs, burn-rate alerting, cardinali
 
 | Scenario | Impact | Mitigation |
 |----------|--------|------------|
-| **Hot key saturation** | One client (e.g., `clientId=acme`) at 100K rps hammers a single Redis key | Hybrid approach already solves it — local counters absorb per-request writes, Redis sees ~100 ops/sec (50 pods × 2 syncs/sec). If 1000+ pods: sub-shard the key into N pieces, write to random sub-key, sum on read. |
+| **Hot key saturation** | One client (e.g., `clientId=acme`) at 100K rps hammers a single Redis key | Hybrid approach already solves it — local counters absorb per-request writes, Redis sees ~100 pipelined round-trips/sec (50 pods × 2 syncs/sec), i.e. ~200 commands/sec (`INCRBY` + `GET`). If 1000+ pods: sub-shard the key into N pieces, write to random sub-key, sum on read. |
 | **Redis Cluster outage** | Can't sync counters or read rules from cache | [Circuit breaker](/patterns/circuit-breaker) trips → fail-open with local-only counters (permissive). Redis auto-failover recovers in ~seconds. |
 | **Redis shard overload** | One shard receives disproportionate traffic; increased latency | Monitor per-shard ops/sec; rebalance hash slots across nodes. Hash tags can inadvertently co-locate too many keys — audit tag usage. |
 | **Rule propagation lag** | Admin updates a rule; gateways enforce stale rule for up to 60s | Acceptable — eventual consistency. Pub/sub delivers in ~1-2s on happy path; 60s TTL is the worst-case safety net. |
 | **Cross-region sync drift** | Regions enforce with stale remote counts; global limit over-admitted by ~10% | By design — we trade strict consistency for local latency. Tunable via sync interval (2s → 1s halves the drift). Not a financial ledger. |
 | **Thundering herd on pod restart** | Pod restarts → local counters zeroed → admits freely for ~500ms until first Redis sync | Pre-warm on startup: fetch active counters from Redis before readiness probe passes. Gate traffic until warm. |
-| **Lua script latency spike** | Complex Lua script (token bucket) blocks Redis single thread; all other commands queue | Keep Lua scripts minimal (~5 commands). Monitor Redis `slowlog`. If p99 spikes, switch hot rules to sliding window (simple INCR, no Lua). |
+| **Lua script latency spike** | Complex Lua script (token bucket) blocks Redis single thread; all other commands queue | Keep Lua scripts minimal (~5 commands). Monitor Redis `slowlog`. If p99 spikes, switch hot rules to sliding window (atomic `INCRBY` + read-only `GET`, no Lua). |
 | **Counter key explosion** | Millions of unique clients × multiple rules × 2 windows = hundreds of millions of keys | TTL auto-cleans expired windows. Monitor `dbsize`; if approaching memory limit, shorten window or reduce rule count per identity. |
 
 ## 7. Trade-offs & Alternatives
@@ -574,7 +591,7 @@ For the generic layer model (USE / RED, SLIs/SLOs, burn-rate alerting, cardinali
 | Placement | API Gateway plugin | Dedicated service / sidecar | No extra hop; coupled to gateway vendor but no new infra |
 | Default algorithm | Sliding Window Counter | Fixed Window / Token Bucket / Sliding Log | ~1-2% approximation for O(1) memory + no boundary burst |
 | Burst algorithm | Token Bucket (per rule) | Sliding Window for all | Lua script complexity for explicit burst control |
-| Counter store | Hybrid (local + periodic Redis sync) | Redis-only / local-only | 0.1ms hot path; ~0.8% overshoot during sync interval |
+| Counter store | Hybrid (local + periodic Redis sync) | Redis-only / local-only | 0.1ms hot path; typical ~0.8% overshoot (1000 × 0.5s / 60s ≈ 8 requests), worst case up to 2× limit for one sync cycle if all pods burst in the same 500ms interval (jitter mitigates) |
 | Multi-region | Per-region Redis + async sync (2s) | Single global Redis / CRDTs | ~10% cross-region overshoot for local-only latency |
 | Failure mode | Fail-open (permissive) | Fail-closed / conservative local | Over-admits during outage; better than blocking paying customers |
 | Rule propagation | Redis pub/sub + 60s TTL | Polling / direct push | Event-driven (zero cost when idle); 60s worst-case staleness |
@@ -586,6 +603,7 @@ For the generic layer model (USE / RED, SLIs/SLOs, burn-rate alerting, cardinali
 
 - [Rate Limiting Algorithms](/patterns/rate-limiting) — fixed window, sliding window, sliding log, leaky bucket, token bucket — with pseudocode + Java implementations
 - [Redis Cluster](/building-blocks/redis) — hash slots, key routing, hash tags, replication, failover
+- [Apache Kafka](/building-blocks/kafka) — the cross-region delta topic (`rl-counter-deltas`) the Sync Service publishes to and consumes from
 - [Sharding](/distributed-systems/sharding) — key lookup approaches, hot partition problem, sub-sharding
 - [Partitioning](/distributed-systems/partitioning) — partition key design, skew from a key-design angle
 - [Consistent Hashing](/distributed-systems/consistent-hashing) — ring-based distribution (used by Cassandra/DynamoDB, not Redis)
@@ -602,10 +620,12 @@ For the generic layer model (USE / RED, SLIs/SLOs, burn-rate alerting, cardinali
 | Unique client keys | 10M |
 | Active rules | 5 |
 | Counter keys (peak) | 10M × 5 × 2 windows = 100M |
-| Memory per key | ~128 bytes (sliding window) / ~200 bytes (token bucket) |
-| Total Redis memory | ~12.8 GB (sliding window) |
-| Redis Cluster | 3 primaries + 3 replicas (~4.3 GB/shard) |
-| Sync interval (local → Redis) | 500ms |
+| Memory per key | ~120 bytes (sliding window: 32 B key + 8 B value + ~80 B Redis overhead) / ~200 bytes (token bucket) |
+| Total Redis memory | ~12 GB (sliding window) |
+| Redis Cluster | 3 primaries + 3 replicas (~4 GB/shard) |
+| Counter TTL | 2 × windowSeconds (previous window stays readable) |
+| Sync interval (local → Redis, gateway thread) | 500ms, jittered |
+| Hybrid overshoot (per region) | Typical ~0.8% (1000 × 0.5s / 60s ≈ 8 requests); worst case up to 2× limit for one sync cycle |
 | Cross-region sync interval | 2s |
 | Rule change frequency | ~1-10/day |
 | Rule propagation (happy path) | ~1-2s (pub/sub) |

@@ -222,30 +222,26 @@ components:
       - id: cs_connection_registry
         name: "Connection Registry"
         keyPattern: "conn:{userId}"
-        defaultTtlSeconds: 60
+        defaultTtlSeconds: 0
         valueFields:
-          - { name: serverId, field_type: string, required: true, description: "WebSocket pod id" }
-          - { name: connId, field_type: string, required: true, description: "Connection id" }
+          - { name: clientId, field_type: string, required: true, description: "Stable registered device id" }
+          - { name: serverId, field_type: string, required: true, description: "WebSocket pod that owns this socket" }
+          - { name: connId, field_type: string, required: true, description: "Unique WebSocket session id" }
+          - { name: expiresAt, field_type: number, required: true, description: "Per-endpoint expiry epoch ms (now + 120s, refreshed by the pod every 60s; heartbeats are not registry writes); Redis sorted-set score" }
       - id: cs_inbox
-        name: "User Inbox"
-        keyPattern: "inbox:{userId}"
+        name: "Device Inbox"
+        keyPattern: "inbox:{clientId}"
         defaultTtlSeconds: 0
         valueFields:
           - { name: messageId, field_type: string, required: true, description: "Message id" }
           - { name: chatId, field_type: string, required: true, description: "Chat id" }
           - { name: timestamp, field_type: number, required: true, description: "Sort score (epoch ms)" }
-      - id: cs_presence
-        name: "Presence"
-        keyPattern: "presence:{userId}"
-        defaultTtlSeconds: 60
-        valueFields:
-          - { name: lastSeen, field_type: number, required: true, description: "Heartbeat epoch ms" }
       - id: cs_message_status
-        name: "Message Status"
+        name: "Device Message Status"
         keyPattern: "status:{messageId}"
         defaultTtlSeconds: 0
         valueFields:
-          - { name: userId, field_type: string, required: true, description: "Recipient user id" }
+          - { name: clientId, field_type: string, required: true, description: "Target device id" }
           - { name: status, field_type: string, required: true, description: "SENT|DELIVERED|READ" }
       - id: cs_chat_participants
         name: "Chat Participants Cache"
@@ -270,11 +266,12 @@ components:
         primaryKey: chat_id
         columns:
           - { name: chat_id, field_type: string, required: true, description: "Partition key" }
-          - { name: timestamp, field_type: number, required: true, description: "Clustering key (DESC)" }
-          - { name: message_id, field_type: string, required: true, description: "Message id" }
+          - { name: timestamp, field_type: number, required: true, description: "Clustering key 1 (DESC)" }
+          - { name: message_id, field_type: string, required: true, description: "Clustering key 2 (DESC); tiebreaker so same-ms messages never overwrite" }
           - { name: sender_id, field_type: string, required: true, description: "Sender user id" }
           - { name: content, field_type: string, required: true, description: "E2E ciphertext blob" }
           - { name: media_url, field_type: string, required: false, description: "Encrypted media key" }
+          - { name: status, field_type: string, required: true, description: "UPLOADING|SENT (rows expire via 30-day TTL + TWCS, no per-row deletes)" }
 
   kafka:
     type: EventStream
@@ -291,6 +288,8 @@ components:
           - { name: messageId, field_type: string, required: true, description: "Message id" }
           - { name: chatId, field_type: string, required: true, description: "Chat id (partition key)" }
           - { name: senderId, field_type: string, required: true, description: "Sender user id" }
+          - { name: membershipVersion, field_type: number, required: true, description: "Membership version at send time" }
+          - { name: recipientSnapshot, field_type: string, required: true, description: "Recipient devices [{clientId, userId}] captured at send time; worker never re-reads membership" }
       - id: topic_notifications
         name: "notifications"
         partitionKey: userId
@@ -566,16 +565,16 @@ edges:
   - source: user_service
     target: redis
     edge_type: CACHE_CALL
-    contract_id: cs_presence
-    operation: SET
-    label: "Write presence"
+    contract_id: cs_connection_registry
+    operation: GET
+    label: "Presence = live endpoint"
     source_handle: source-right-1
     target_handle: target-top-2
     latency_ms: 2
     input_bindings:
       - id: ib_user_presence
         source_contract_id: ep_get_presence
-        label: "Heartbeat TTL set"
+        label: "ZRANGEBYSCORE conn:{userId} (now +inf"
         field_mappings: []
 
   - source: user_service

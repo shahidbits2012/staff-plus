@@ -1,36 +1,121 @@
-:root {
-  --ifm-color-primary: #3b82f6;
-  --ifm-color-primary-dark: #2563eb;
-  --ifm-color-primary-darker: #1d4ed8;
-  --ifm-color-primary-darkest: #1e40af;
-  --ifm-color-primary-light: #60a5fa;
-  --ifm-color-primary-lighter: #93bbfd;
-  --ifm-color-primary-lightest: #bfdbfe;
-  --ifm-code-font-size: 90%;
-  --ifm-font-family-base: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+/* ─────────────────────────────────────────────────────────────────────────────
+   Staff Prep theme — mirrors the Vetora blog look & feel
+   (vetora/web/src/app/globals.css + components/blog/*).
+
+   GitHub Dark is the default; GitHub Light applies under
+   html[data-theme='light']. Vetora tokens (--vt-*) are defined once per mode
+   and mapped onto Infima (--ifm-*) so every stock Docusaurus component
+   inherits them.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+/* ── Tokens: GitHub Dark (default) ────────────────────────────────────────── */
+html[data-theme='dark'] {
+  --vt-bg: #0d1117;
+  --vt-surface: #161b22;
+  --vt-surface-hover: #1c2129;
+  --vt-border: #30363d;
+  --vt-border-subtle: #21262d;
+
+  --vt-text: #e6edf3;
+  --vt-text-secondary: #8b949e;
+  --vt-text-muted: #8b949e;
+  --vt-link: #58a6ff;
+
+  --vt-blue: #58a6ff;
+  --vt-purple: #bc8cff;
+  --vt-green: #3fb950;
+  --vt-amber: #d29922;
+  --vt-red: #f85149;
+  --vt-cyan: #56d4dd;
+
+  --ifm-color-primary: #58a6ff;
+  --ifm-color-primary-dark: #388bfd;
+  --ifm-color-primary-darker: #1f6feb;
+  --ifm-color-primary-darkest: #1158c7;
+  --ifm-color-primary-light: #79c0ff;
+  --ifm-color-primary-lighter: #a5d6ff;
+  --ifm-color-primary-lightest: #cae8ff;
+
+  --docusaurus-highlighted-code-line-bg: rgba(88, 166, 255, 0.12);
 }
 
-[data-theme='dark'] {
-  --ifm-color-primary: #60a5fa;
-  --ifm-color-primary-dark: #3b82f6;
-  --ifm-color-primary-darker: #2563eb;
-  --ifm-color-primary-darkest: #1d4ed8;
-  --ifm-color-primary-light: #93bbfd;
-  --ifm-color-primary-lighter: #bfdbfe;
-  --ifm-color-primary-lightest: #dbeafe;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+/* ── Tokens: GitHub Light ─────────────────────────────────────────────────── */
+html[data-theme='light'] {
+  --vt-bg: #ffffff;
+  --vt-surface: #f6f8fa;
+  --vt-surface-hover: #eaeef2;
+  --vt-border: #d0d7de;
+  --vt-border-subtle: #d0d7de;
+
+  --vt-text: #1f2328;
+  --vt-text-secondary: #656d76;
+  --vt-text-muted: #656d76;
+  --vt-link: #0969da;
+
+  --vt-blue: #0969da;
+  --vt-purple: #8250df;
+  --vt-green: #1a7f37;
+  --vt-amber: #9a6700;
+  --vt-red: #cf222e;
+  --vt-cyan: #0e7c86;
+
+  --ifm-color-primary: #0969da;
+  --ifm-color-primary-dark: #0860ca;
+  --ifm-color-primary-darker: #0757b5;
+  --ifm-color-primary-darkest: #054da7;
+  --ifm-color-primary-light: #218bff;
+  --ifm-color-primary-lighter: #54aeff;
+  --ifm-color-primary-lightest: #80ccff;
+
+  --docusaurus-highlighted-code-line-bg: rgba(9, 105, 218, 0.1);
 }
 
-/* Use full width for doc content */
-.docMainContainer_node_modules-\@docusaurus-theme-classic-lib-theme-DocPage-Layout-Main-styles-module {
-  max-width: 100%;
+/* ── Vetora → Infima mapping (both modes) ─────────────────────────────────── */
+/* html[data-theme] matches Infima's own selector specificity so these win. */
+html[data-theme='dark'],
+html[data-theme='light'] {
+  --ifm-font-family-base: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --ifm-font-family-monospace: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+  --ifm-code-font-size: 88%;
+  --ifm-global-radius: 0.75rem;
+
+  --ifm-background-color: var(--vt-bg);
+  --ifm-background-surface-color: var(--vt-surface);
+  --ifm-font-color-base: var(--vt-text);
+  --ifm-color-content: var(--vt-text);
+  --ifm-color-content-secondary: var(--vt-text-secondary);
+  --ifm-heading-color: var(--vt-text);
+  --ifm-link-color: var(--vt-link);
+  --ifm-hr-border-color: var(--vt-border-subtle);
+  --ifm-toc-border-color: var(--vt-border-subtle);
+
+  --ifm-table-border-color: var(--vt-border-subtle);
+  --ifm-table-head-background: var(--vt-surface);
+  --ifm-table-stripe-background: transparent;
+  --ifm-code-background: var(--vt-surface-hover);
+
+  --ifm-navbar-background-color: color-mix(in srgb, var(--vt-bg) 85%, transparent);
+  --ifm-navbar-shadow: none;
+  --ifm-footer-background-color: var(--vt-bg);
+  --ifm-card-background-color: var(--vt-surface);
+  --ifm-dropdown-background-color: var(--vt-surface);
+
+  --ifm-menu-color: var(--vt-text-secondary);
+  --ifm-menu-color-active: var(--vt-text);
+  --ifm-menu-color-background-active: color-mix(in srgb, var(--vt-blue) 12%, transparent);
+  --ifm-menu-color-background-hover: var(--vt-surface-hover);
 }
 
-[class*='docItemContainer'] {
-  max-width: 100%;
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
+/* ── Layout ───────────────────────────────────────────────────────────────── */
+/* Full-width docs: problem pages carry wide tables and diagrams. */
+[class*='docItemContainer'],
 article {
   max-width: 100%;
 }
@@ -39,37 +124,486 @@ article {
   max-width: 1400px;
 }
 
-/* Admonition styling for trade-off boxes */
-.admonition-tradeoff {
-  border-left-color: #f59e0b;
+/* ── Chrome: navbar, sidebar, footer ──────────────────────────────────────── */
+.navbar {
+  border-bottom: 1px solid var(--vt-border-subtle);
+  backdrop-filter: saturate(180%) blur(12px);
 }
 
-/* Better table styling */
-table {
+.navbar__title {
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.theme-doc-sidebar-container {
+  border-right-color: var(--vt-border-subtle) !important;
+}
+
+.theme-doc-sidebar-menu .menu__link {
+  font-size: 14px;
+  border-radius: 0.5rem;
+}
+
+.theme-doc-sidebar-menu .menu__link--active:not(.menu__link--sublist) {
+  font-weight: 600;
+  color: var(--vt-blue);
+}
+
+.footer {
+  border-top: 1px solid var(--vt-border-subtle);
+}
+
+.footer--dark {
+  --ifm-footer-background-color: var(--vt-bg);
+  --ifm-footer-link-color: var(--vt-text-secondary);
+  --ifm-footer-title-color: var(--vt-text);
+  --ifm-footer-color: var(--vt-text-muted);
+}
+
+/* ── Article typography (Vetora ArticleBlocks: Lead / P / Section / H3) ──── */
+.theme-doc-markdown {
+  font-size: 17px;
+  line-height: 1.8;
+  color: var(--vt-text-secondary);
+}
+
+.theme-doc-markdown p,
+.theme-doc-markdown li {
+  color: var(--vt-text-secondary);
+}
+
+.theme-doc-markdown strong {
+  color: var(--vt-text);
+  font-weight: 600;
+}
+
+.theme-doc-markdown h1,
+.theme-doc-markdown h2,
+.theme-doc-markdown h3,
+.theme-doc-markdown h4 {
+  color: var(--vt-text);
+  letter-spacing: -0.02em;
+}
+
+.theme-doc-markdown h1 {
+  font-size: clamp(34px, 5vw, 48px);
+  font-weight: 800;
+  line-height: 1.05;
+  margin-bottom: 1.5rem;
+}
+
+/* Lead paragraph directly under the page title */
+.theme-doc-markdown > h1 + p,
+.theme-doc-markdown > header + p {
+  max-width: 60ch;
+  color: var(--vt-text-secondary);
+  font-size: 19px;
+  line-height: 1.6;
+}
+
+/* ── Doc header glow (src/theme/DocItem/Layout) ───────────────────────────── */
+.vt-doc-layout {
+  position: relative;
+  isolation: isolate;
+}
+
+.vt-doc-glow {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 460px;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(900px 380px at 85% -15%, color-mix(in srgb, var(--vt-blue) 18%, transparent), transparent 70%),
+    radial-gradient(700px 320px at -5% 60%, color-mix(in srgb, var(--vt-purple) 10%, transparent), transparent 70%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
+  mask-image: linear-gradient(to bottom, #000 55%, transparent);
+}
+
+html[data-theme='light'] .vt-doc-glow {
+  opacity: 0.7;
+}
+
+.theme-doc-markdown h2 {
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-top: 4rem;
+  margin-bottom: 1.25rem;
+  padding-top: 2rem;
+  border-top: 1px solid var(--vt-border-subtle);
+}
+
+.theme-doc-markdown h3 {
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.3;
+  margin-top: 2.75rem;
+}
+
+.theme-doc-markdown h4 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-top: 2rem;
+}
+
+/* h5 is used for numbered "story" steps — accent marker keeps them scannable. */
+.theme-doc-markdown h5 {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--vt-text);
+  margin-top: 2.5rem;
+  padding-left: 0.75rem;
+  border-left: 3px solid var(--vt-blue);
+}
+
+.theme-doc-markdown a:not(.hash-link) {
+  text-decoration: none;
+}
+
+.theme-doc-markdown a:not(.hash-link):hover {
+  text-decoration: underline;
+}
+
+.theme-doc-markdown ul li::marker {
+  color: var(--vt-blue);
+}
+
+.theme-doc-markdown ol li::marker {
+  color: var(--vt-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.theme-doc-markdown blockquote {
+  border-left: 3px solid var(--vt-border);
+  color: var(--vt-text-secondary);
+}
+
+.theme-doc-markdown hr {
+  border-color: var(--vt-border-subtle);
+}
+
+.hash-link {
+  color: var(--vt-text-muted);
+}
+
+/* ── Inline code ──────────────────────────────────────────────────────────── */
+.theme-doc-markdown :not(pre) > code {
+  border: none;
+  border-radius: 0.375rem;
+  padding: 0.15em 0.4em;
+  color: var(--vt-text);
+  background: var(--vt-surface-hover);
+}
+
+/* ── Code blocks (Vetora CodeBlock) ───────────────────────────────────────── */
+.theme-code-block {
+  --prism-background-color: var(--vt-surface) !important;
+  border: 1px solid var(--vt-border-subtle);
+  border-radius: 0.75rem;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+[data-theme='dark'] .theme-code-block {
+  --prism-background-color: #0d1117 !important;
+}
+
+.theme-code-block pre {
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.theme-code-block [class*='codeBlockTitle'] {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 12px;
+  color: var(--vt-text-muted);
+  background: var(--vt-surface);
+  border-bottom: 1px solid var(--vt-border-subtle);
+}
+
+/* ── Tables (Vetora DataTable) ────────────────────────────────────────────── */
+.theme-doc-markdown table {
   display: table;
   width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--vt-border-subtle);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  font-size: 14.5px;
+  line-height: 1.6;
 }
 
-table th {
+.theme-doc-markdown thead tr {
+  background: var(--vt-surface);
+  border: none;
+}
+
+.theme-doc-markdown th {
   text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--vt-text-muted);
+  border: none;
+  border-bottom: 1px solid var(--vt-border-subtle);
+  padding: 0.75rem 0.85rem;
 }
 
-/* Mermaid diagram sizing */
-.mermaid {
-  text-align: center;
+.theme-doc-markdown td {
+  border: none;
+  border-top: 1px solid var(--vt-border-subtle);
+  padding: 0.75rem 0.85rem;
+  color: var(--vt-text-secondary);
+  vertical-align: top;
 }
 
-/* :::staff — Staff+ Insight callout */
+.theme-doc-markdown tbody tr:first-child td {
+  border-top: none;
+}
+
+.theme-doc-markdown td:first-child {
+  color: var(--vt-text);
+}
+
+.theme-doc-markdown tr {
+  background: transparent;
+}
+
+.theme-doc-markdown tbody tr:hover {
+  background: var(--vt-surface-hover);
+}
+
+/* ── Callouts (Vetora Callout) ────────────────────────────────────────────── */
+/* One rule set; each admonition type only picks its accent. */
+.theme-admonition {
+  --vt-accent: var(--vt-blue);
+  border: none;
+  border-left: 4px solid var(--vt-accent);
+  border-radius: 0.75rem;
+  box-shadow: none;
+  padding: 1rem 1.25rem;
+  background: color-mix(in srgb, var(--vt-accent) 8%, transparent);
+  color: var(--vt-text);
+}
+
+.theme-admonition-note {
+  --vt-accent: var(--vt-cyan);
+}
+.theme-admonition-info {
+  --vt-accent: var(--vt-blue);
+}
+.theme-admonition-tip {
+  --vt-accent: var(--vt-green);
+}
+.theme-admonition-warning,
+.theme-admonition-caution {
+  --vt-accent: var(--vt-amber);
+}
+.theme-admonition-danger {
+  --vt-accent: var(--vt-red);
+}
+/* :::staff — Vetora's "Why it matters" insight callout */
+.theme-admonition-staff,
 .admonition-staff {
-  --ifm-alert-background-color: #f5f3ff;
-  --ifm-alert-background-color-highlight: rgba(124, 58, 237, 0.15);
-  --ifm-alert-foreground-color: #3b0764;
-  --ifm-alert-border-color: #7c3aed;
+  --vt-accent: var(--vt-purple);
 }
 
-[data-theme='dark'] .admonition-staff {
-  --ifm-alert-background-color: #2e1065;
-  --ifm-alert-background-color-highlight: rgba(167, 139, 250, 0.2);
-  --ifm-alert-foreground-color: #ede9fe;
-  --ifm-alert-border-color: #a78bfa;
+.theme-admonition [class*='admonitionHeading'] {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--vt-accent);
+  margin-bottom: 0.35rem;
+}
+
+.theme-admonition [class*='admonitionIcon'] svg {
+  fill: var(--vt-accent);
+  stroke: var(--vt-accent);
+  width: 1em;
+  height: 1em;
+}
+
+.theme-admonition [class*='admonitionContent'] {
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.theme-admonition [class*='admonitionContent'] p,
+.theme-admonition [class*='admonitionContent'] li {
+  color: var(--vt-text);
+}
+
+.theme-admonition a {
+  color: var(--vt-link);
+  text-decoration: none;
+}
+
+.theme-admonition a:hover {
+  text-decoration: underline;
+}
+
+.theme-admonition code {
+  background: color-mix(in srgb, var(--vt-accent) 14%, transparent);
+}
+
+/* Legacy class kept for any `.admonition-tradeoff` usage */
+.admonition-tradeoff {
+  --vt-accent: var(--vt-amber);
+}
+
+/* ── Table of contents ("On this page") ───────────────────────────────────── */
+.theme-doc-toc-desktop {
+  padding-top: 0.5rem;
+}
+
+.theme-doc-toc-desktop::before {
+  content: 'On this page';
+  display: block;
+  margin-bottom: 0.75rem;
+  padding-left: 0.25rem;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--vt-text-muted);
+}
+
+.table-of-contents {
+  font-size: 13px;
+}
+
+.table-of-contents__left-border {
+  border-left: 1px solid var(--vt-border-subtle);
+  padding-left: 0 !important;
+}
+
+.table-of-contents__link {
+  display: block;
+  margin-left: -1px;
+  padding: 0.15rem 0 0.15rem 0.75rem;
+  border-left: 2px solid transparent;
+  line-height: 1.45;
+  color: var(--vt-text-secondary);
+}
+
+.table-of-contents__link:hover {
+  color: var(--vt-text);
+  border-left-color: var(--vt-border);
+  text-decoration: none;
+}
+
+.table-of-contents__link--active {
+  color: var(--vt-blue);
+  border-left-color: var(--vt-blue);
+  font-weight: 600;
+}
+
+.table-of-contents ul {
+  padding-left: 0.75rem;
+}
+
+/* ── Mermaid diagrams as Vetora figure cards ──────────────────────────────── */
+.docusaurus-mermaid-container {
+  text-align: center;
+  margin: 1.5rem 0;
+  padding: 1.5rem;
+  border: 1px solid var(--vt-border-subtle);
+  border-radius: 1rem;
+  background: var(--vt-surface);
+  overflow-x: auto;
+}
+
+/* Edge labels: blend into the card instead of Mermaid's grey boxes */
+.docusaurus-mermaid-container .edgeLabel,
+.docusaurus-mermaid-container .edgeLabel p,
+.docusaurus-mermaid-container .labelBkg {
+  background-color: var(--vt-surface) !important;
+  color: var(--vt-text-secondary) !important;
+}
+.docusaurus-mermaid-container .edgeLabel rect {
+  fill: var(--vt-surface) !important;
+  opacity: 1 !important;
+}
+
+/* Subgraph clusters: faint tint instead of Mermaid's opaque grey */
+.docusaurus-mermaid-container .cluster rect {
+  fill: color-mix(in srgb, var(--vt-blue) 5%, transparent) !important;
+  stroke: var(--vt-border) !important;
+  rx: 8px;
+}
+.docusaurus-mermaid-container .cluster-label,
+.docusaurus-mermaid-container .cluster-label span {
+  color: var(--vt-text-secondary) !important;
+}
+
+/* ── Breadcrumbs & pagination ─────────────────────────────────────────────── */
+.breadcrumbs__link {
+  font-size: 13px;
+  color: var(--vt-text-muted);
+}
+
+.breadcrumbs__item--active .breadcrumbs__link {
+  color: var(--vt-text);
+  background: var(--vt-surface);
+}
+
+.pagination-nav__link {
+  border: 1px solid var(--vt-border-subtle);
+  border-radius: 1rem;
+  background: var(--vt-surface);
+  transition: border-color 150ms ease, transform 150ms ease;
+}
+
+.pagination-nav__link:hover {
+  border-color: var(--vt-blue);
+  transform: translateY(-2px);
+}
+
+.pagination-nav__sublabel {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--vt-text-muted);
+}
+
+/* ── Scrollbars & focus ───────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--vt-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--vt-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vt-text-muted);
+}
+
+:focus-visible {
+  outline: 2px solid var(--vt-blue);
+  outline-offset: 2px;
+}
+
+/* ── Cheat-sheet mode (src/components/CheatSheetToggle) ───────────────────── */
+/* Hide the full design (everything after the toggle) and its TOC. */
+html[data-vt-view='cheatsheet'] .theme-doc-markdown > .vt-cheat-host ~ *,
+html[data-vt-view='cheatsheet'] .theme-doc-toc-desktop,
+html[data-vt-view='cheatsheet'] .theme-doc-toc-mobile {
+  display: none !important;
+}
+
+/* Cheat sheets are dense — tighter rhythm than long-form pages */
+.vt-cheat-host h3 {
+  margin-top: 2.5rem;
 }

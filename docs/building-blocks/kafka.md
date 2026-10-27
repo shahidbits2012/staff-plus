@@ -210,13 +210,13 @@ Partition 0:
 | RF | Durability | Cost | Tolerable failures |
 |----|-----------|------|-------------------|
 | 1 | None — data lost if broker dies | Low | 0 |
-| **3** | **Standard — survives 2 failures** | **Moderate** | **2** |
+| **3** | **Standard — no acknowledged data lost with up to 2 replicas down** | **Moderate** | **2 for durability (1 while still accepting writes, with `min.insync.replicas=2`)** |
 | 5 | Extreme durability | High | 4 |
 
-**Recommended: RF=3** with `min.insync.replicas=2`. This means:
+**Recommended: RF=3** with `min.insync.replicas=2` and `acks=all`. This means:
 - Writes succeed if at least 2 of 3 replicas acknowledge
-- Survives 1 broker failure without any data loss or unavailability
-- 2 broker failures → writes fail (safe) rather than losing data
+- 1 broker down → still accepts writes, no data loss, no unavailability
+- 2 replicas down → no acknowledged data is lost (keep `unclean.leader.election.enable=false`), but writes block (`NotEnoughReplicas`) until a replica returns; reads are still possible from the survivor
 
 ## Ordering Guarantees
 

@@ -79,6 +79,10 @@ public RateLimitResult checkFixedWindow(String clientId, Rule rule) {
 
 **Redis cost:** 1 INCR (+1 EXPIRE on first hit)
 
+:::tip Idempotent TTL: `EXPIRE ... NX`
+The `if count == 1` check leaves a key with no TTL if the process dies between `INCR` and `EXPIRE`. On Redis 7+, pipeline `INCR key` + `EXPIRE key ttl NX` on every call instead: `NX` sets the TTL only if the key has none, so repeats are harmless and the TTL is never extended. The same applies to the sliding window counter below (with `ttl = 2 × window`).
+:::
+
 ### Pros
 - Simplest implementation — single INCR + TTL
 - O(1) memory per key
@@ -117,8 +121,9 @@ def check_sliding_window(client_id, rule):
     current_window = floor(now / rule.window_seconds)
     previous_window = current_window - 1
 
-    curr_key = f"rl:{rule.id}:{client_id}:{current_window}"
-    prev_key = f"rl:{rule.id}:{client_id}:{previous_window}"
+    # {rule:client} is a Redis Cluster hash tag: both windows land in the same slot
+    curr_key = f"rl:{{{rule.id}:{client_id}}}:{current_window}"
+    prev_key = f"rl:{{{rule.id}:{client_id}}}:{previous_window}"
 
     prev_count, curr_count = redis.pipeline(
         GET(prev_key),
@@ -145,8 +150,9 @@ public RateLimitResult checkSlidingWindow(String clientId, Rule rule) {
     long currentWindow = now / rule.getWindowSeconds();
     long previousWindow = currentWindow - 1;
 
-    String currKey = String.format("rl:%s:%s:%d", rule.getId(), clientId, currentWindow);
-    String prevKey = String.format("rl:%s:%s:%d", rule.getId(), clientId, previousWindow);
+    // {rule:client} is a Redis Cluster hash tag: both windows land in the same slot
+    String currKey = String.format("rl:{%s:%s}:%d", rule.getId(), clientId, currentWindow);
+    String prevKey = String.format("rl:{%s:%s}:%d", rule.getId(), clientId, previousWindow);
 
     List<Object> results = redis.executePipelined((RedisCallback<Object>) conn -> {
         conn.get(prevKey.getBytes());

@@ -545,8 +545,8 @@ Read query hits partition → scans 100K tombstones → finds 50 live rows → s
 
 **Mitigations:**
 - Reduce `gc_grace_seconds` (risky -- must ensure all replicas have received the delete)
-- Use TTL instead of explicit deletes (tombstone still created but with automatic expiry)
-- Use TimeWindowCompaction for time-series data (entire SSTables dropped when window expires)
+- Use TTL instead of explicit deletes (expired cells still behave like tombstones if a read or compaction touches them)
+- Use TimeWindowCompaction for time-series data (entire SSTables dropped when every row in the window has expired). Combined with a TTL this means no per-row `DELETE`s at all — e.g. the [Chat System](/problems/messaging/chat-system#cassandra-schema-for-messages) logically deletes a message on ACK and lets a 30-day TTL + TWCS remove it physically
 - **Don't use Cassandra for queue-like patterns** -- use [Redis](/building-blocks/redis) or a dedicated queue
 
 ## Scaling Considerations

@@ -46,7 +46,7 @@ Each WebSocket connection = 1 TCP socket = 1 file descriptor. The binding constr
 | Servers needed | Total connections / connections per server | ~235 |
 
 :::tip Kubernetes Pods
-In practice, run fewer connections per pod (100-200K) to leave headroom for GC, spikes, and graceful draining during deploys. This means 750-1500 pods for 150M connections.
+**100-200K connections per pod is a conservative default** for typical runtimes (thread-per-connection or GC-heavy stacks): it leaves headroom for GC, spikes, and graceful draining during deploys, and means 750-1500 pods for 150M connections. Tuned event-loop servers (epoll, small per-connection buffers — e.g. Erlang/BEAM, Go, Netty) reach **~500K-1M+ per pod**. The [Chat System](/problems/messaging/chat-system#51-client-server-connection-management) design uses ~640K/pod (32GB of a 64GB pod ÷ ~50KB per connection → ~235 pods), accepting a larger per-pod blast radius on restarts.
 :::
 
 ## Connection Registry
@@ -99,9 +99,13 @@ Centralized key-value mapping: `userId → serverId` in Redis.
 |------|------|
 | 150M keys is trivial (~20GB memory) | Need TTL + heartbeat for stale entries |
 | O(1) lookup, ~1ms latency | Eventually consistent on failover (small window of ~seconds) |
-| Multi-device support naturally (hash per user → set of connections) | Redis is an infrastructure dependency |
-| Server add/remove is seamless — no rehashing | |
+| Multi-device support naturally (sorted set per user → one scored member per connection) | Redis is an infrastructure dependency |
+| Server add/remove is seamless — no app-visible rehashing | |
 | Built-in sharding across cluster nodes | |
+
+:::note "No rehashing" means no rehashing visible to your app
+Redis Cluster **is** sharded — 16384 hash slots distributed across nodes. When a node is added or removed, Redis **live-migrates** slots in the background and redirects clients transparently via `MOVED` responses. Your app just does `GET conn:{userId}` — it never sees the migration. Contrast with consistent hashing (Approach B), where adding a **WebSocket server** changes `hash(userId) % N` and forces affected users to physically **reconnect their WebSocket** to a different server. With Redis Cluster, adding a **Redis node** only moves registry data — the WebSocket connections themselves are completely unaffected because the registry is a lookup table, not the routing mechanism.
+:::
 
 ### Approach E: In-Memory with Gossip Protocol
 
@@ -112,6 +116,24 @@ Each server maintains a partial connection map, synchronized via gossip (like Ca
 | No central dependency | Convergence delay → stale routes during propagation |
 | Partition-tolerant | N servers × M connections = massive gossip payload |
 | | Complex to implement correctly |
+
+:::staff[Why gossip fails for connection registries at scale]
+Gossip works well for **cluster membership** (which servers exist) — small, rarely changing state. Cassandra, Consul, and Redis Cluster itself use gossip for node membership. But a connection registry is a **high-cardinality, high-churn lookup table** — the opposite of what gossip handles well:
+
+1. **Convergence delay = misrouted messages.** Gossip propagates in O(log N) rounds at ~1-2s per round. With 200 servers, a connection change takes ~15s to fully propagate. During that window, messages route to the old server → silent loss.
+2. **State size explodes.** Each server holds the full map: 150M connections × ~64 bytes = ~10GB per server. Redis holds it once, centrally.
+3. **Connection churn creates a storm.** Mobile clients connect/disconnect constantly (network switches, app backgrounding). At 10K churn events/sec, gossip becomes a continuous flood of updates that never fully converges.
+
+| | Gossip | Redis Cluster |
+|---|---|---|
+| Lookup latency | Variable (local but possibly stale) | ~1ms (always current) |
+| State per server | Full map (~10GB) | Zero (centralized) |
+| Update propagation | ~15s (O(log N) rounds) | Immediate (write-through) |
+| Churn tolerance | Poor — every event floods the cluster | Excellent — single SET/DEL per event |
+| Failure mode | Stale routes → silent message loss | Redis down → fail-open with circuit breaker |
+
+The only scenario where gossip wins is **extreme partition tolerance** — you'd rather have stale data than no data, and you cannot depend on any central component. That's rarely the right trade-off for a chat system where misrouted messages = user-visible failures.
+:::
 
 ### Decision Guide
 
@@ -124,23 +146,32 @@ Each server maintains a partial connection map, synchronized via gossip (like Ca
 
 ### Redis Cluster Implementation
 
+**Recommended (multi-device): sorted set scored by per-endpoint expiry.** One member per live connection, score = the time that endpoint stops being routable:
+
 ```
-On connect:    HSET conn:{userId} "server-182:conn-abc" {timestamp}
-On disconnect: HDEL conn:{userId} "server-182:conn-abc"
-On route:      HGETALL conn:{recipientId} → [{serverId, connId}, ...]
+Key:    conn:{userId}                      Type: sorted set
+Member: {clientId}|{serverId}|{connId}     Score: expiresAt (epoch ms)
+
+On connect:    ZADD conn:{userId} <now+120s> "phone-1|server-182|conn-abc"
+On refresh:    ZADD conn:{userId} XX <now+120s> "phone-1|server-182|conn-abc"   (gateway timer, pipelined)
+On disconnect: ZREM conn:{userId} "phone-1|server-182|conn-abc"
+On route:      ZRANGEBYSCORE conn:{recipientId} (<now> +inf   → live endpoints only
+Sweep:         ZREMRANGEBYSCORE conn:{userId} -inf <now>
 ```
 
-**TTL + Heartbeat for stale cleanup:**
-- Client sends heartbeat every 30s → server refreshes TTL to 60s
-- Clean disconnect → explicit `HDEL`
-- Unclean disconnect (crash, network drop) → TTL expires after 60s
-- Server-side sweep every 30s to proactively clean connections that stopped heartbeating
-
-**Multi-device:** Each userId maps to a **set** of `(serverId, connectionId)` pairs. Message delivery fans out to all active devices.
-
-:::note Key-level vs field-level TTL
-`EXPIRE conn:{userId}` applies to the **whole hash**, so a live phone keeps a dead laptop's field alive. Either store the last-heartbeat timestamp as the field value and let readers/sweepers ignore fields older than 60s, or use per-field TTL (`HEXPIRE`, Redis 7.4+).
+:::note What "On route" does
+When the system needs to deliver a message to a user, the fan-out worker calls `ZRANGEBYSCORE conn:{recipientId} (now +inf` to discover **which WebSocket server(s)** the user is currently connected to. It returns every non-expired endpoint (e.g. `phone-1|ws-server-42|c-1`, `laptop-3|ws-server-17|c-9`), and the worker pushes the message to each server, which delivers it over the already-open WebSocket to that device. This is how multi-device delivery works — one lookup, fan-out to all devices.
 :::
+
+**Simpler alternative (single device per user): a hash with one key-level TTL.** `HSET conn:{userId} {deviceId} server-182:conn-abc` + `EXPIRE conn:{userId} 120`. Its drawback is that `EXPIRE` applies to the **whole hash**, so with several devices a live phone keeps a dead laptop's field alive. Workarounds are storing the last-refresh timestamp as the field value and having readers/sweepers ignore old fields, or per-field TTL (`HEXPIRE`, Redis 7.4+) — at which point the sorted set is the cleaner form.
+
+**Expiry + heartbeat for stale cleanup:**
+- Client sends heartbeat every 30s → the gateway tracks it **in memory** (no registry write)
+- Gateway refreshes all of its endpoints every 60s to `now + 120s`, pipelined (see [heartbeat is not a registry write](#back-of-the-envelope-tie-in))
+- Clean disconnect, or a client that misses 2 heartbeats → explicit `ZREM`
+- Gateway crash → its endpoints stop being refreshed and are unroutable within 120s; a periodic `ZREMRANGEBYSCORE` sweep reclaims them
+
+**Multi-device:** Each userId maps to a **set** of `(clientId, serverId, connId)` endpoints, each with its own expiry. Message delivery fans out to all active devices.
 
 ## Reference Architecture (HLD)
 
@@ -228,13 +259,13 @@ Typing indicators, presence pings, and cursor positions don't need persistence. 
 
 ### Back-of-the-Envelope Tie-in
 
-Using the [Capacity Planning](#capacity-planning) numbers above (150M concurrent connections, 100-200K per pod):
+Using the [Capacity Planning](#capacity-planning) numbers above (150M concurrent connections, conservative 100-200K per pod):
 
 | Tier | What drives size | Rough number |
 |------|------------------|--------------|
-| WS Gateways | 150M connections ÷ 200K per pod | ~750 pods → **~750 inbox streams** |
-| Connection Registry (memory) | 150M users × 1-3 device fields | ~20GB+ — small; spread over shards for **ops/sec**, not memory |
-| Connection Registry (writes) | Naive: one TTL refresh per heartbeat = 150M ÷ 30s | **~5M writes/sec** — tens of shards. Pipeline refreshes per gateway and refresh less often than the heartbeat (e.g., every 60s, TTL 120s) to cut this 2-4x |
+| WS Gateways | 150M connections ÷ 200K per pod | ~750 pods → **~750 inbox streams** (~235 at a tuned 640K/pod, as in the [Chat System](/problems/messaging/chat-system)) |
+| Connection Registry (memory) | 150M users × 1-3 device entries | ~20GB+ — small; spread over shards for **ops/sec**, not memory |
+| Connection Registry (writes) | Naive: one expiry refresh per heartbeat = 150M ÷ 30s | **~5M writes/sec** — tens of shards. Pipeline refreshes per gateway and refresh less often than the heartbeat (e.g., every 60s, expiry 120s) → **~2.5M writes/sec**, in far fewer round trips |
 | Message Bus | 1M msgs/sec unicast → at most 1M `XADD`/sec, fewer with batch-by-destination | Spread across shards by stream key |
 | Business Service | Scales on msgs/sec and CPU, independent of connection count | Sized separately |
 
@@ -244,7 +275,7 @@ The gateway tracks client liveness **locally** (it owns the socket). It only nee
 
 ## Data Flows (LLD)
 
-All flows use the registry scheme from [Redis Cluster Implementation](#redis-cluster-implementation): `conn:{userId}` is a hash of `server-N:conn-id → last-heartbeat-ts`, and each gateway consumes its own stream `stream:server-N` (see [Redis Streams](/building-blocks/server-to-server-communication#approach-d-redis-streams)).
+For readability, the flows below use the simpler hash form from [Redis Cluster Implementation](#redis-cluster-implementation): `conn:{userId}` is a hash of `server-N:conn-id → last-refresh-ts`. With the recommended sorted-set form, read `HSET` as `ZADD` (score = expiry), `HDEL` as `ZREM`, and `HGETALL` as `ZRANGEBYSCORE conn:{userId} (now +inf`. Each gateway consumes its own stream `stream:server-N` through a consumer group (see [Redis Streams](/building-blocks/server-to-server-communication#approach-d-redis-streams)).
 
 ### 1. Connection Establishment
 
@@ -538,7 +569,7 @@ Draining 200K sockets over 60s is about 3.3K TLS handshakes/sec landing on the r
 | Failure | Impact | Mitigation |
 |---------|--------|------------|
 | **Server crash** | All connections on that server drop | Client auto-reconnect with jitter (random 0-5s delay); connection registry TTL cleans stale entries |
-| **Redis Cluster node failure** | Routing lookups for affected shard fail | Redis auto-failover to replica (~seconds); fallback to broadcast during failover window |
+| **Redis Cluster node failure** | Routing lookups for affected shard fail | Redis auto-failover to replica (~seconds). Broadcast fallback during the window only works for small fleets / low message rates; at large scale skip the real-time push for affected users and let the durable inbox path deliver on next sync (see [Chat System](/problems/messaging/chat-system#65-component-failure-summary)) |
 | **Stale registry entries** | Messages routed to wrong server | TTL expiry + heartbeat sweep; recipient server drops unroutable messages |
 | **Thundering herd on deploy** | Mass reconnection spike | Graceful drain: server stops accepting new connections, drains existing over 30s; client reconnect jitter |
 | **Registry says online but socket is dead** (half-open TCP) | Message published to the inbox, written into a dead socket, never ACKed | Client-ACK timeout (e.g., 10s) → leave message pending, fall back to push; delivered via gap fill on reconnect. Heartbeat timeout closes the socket and runs `HDEL` |

@@ -35,7 +35,7 @@ Server A sends message for User Y
 | No single point of failure | Network bandwidth explosion at scale |
 | | Doesn't scale beyond ~10 servers |
 
-**Use when:** Small cluster (fewer than 10 servers), prototyping, or as a fallback during registry outages.
+**Use when:** Small cluster (fewer than 10 servers), prototyping, or as a fallback during registry outages — the fallback only works for small fleets and low message rates. At large scale (e.g. ~2.3M msg/s × ~235 pods) broadcast is infeasible; skip the real-time push during the outage and let a durable inbox path deliver instead (see the [Chat System design](/problems/messaging/chat-system#65-component-failure-summary)).
 
 ### Approach B: Direct RPC (gRPC / HTTP)
 
@@ -77,8 +77,9 @@ Server B receives → pushes to User Y
 Like Pub/Sub but with persistence. Each server has a stream. Messages are appended; the server consumes and ACKs.
 
 ```
-Server A → XADD stream:server-B * payload "..."
-Server B → XREAD from stream:server-B → process → XACK
+Server A → XADD stream:server-B MAXLEN ~ 100000 * payload "..."
+Server B → XREADGROUP GROUP cg-server-B server-B BLOCK 0 STREAMS stream:server-B > → process → XACK
+           (on restart, first drain its pending entries with XREADGROUP ... STREAMS stream:server-B 0)
 ```
 
 | Pros | Cons |
@@ -142,7 +143,7 @@ This reduces N publishes to K publishes (where K = number of unique destination 
 | Failure | Impact by Approach | Mitigation |
 |---------|-------------------|------------|
 | **Destination server down** | Pub/Sub: message lost. Streams: queued until server recovers. RPC: sender gets error. | Use Streams for guaranteed delivery; fallback to persistent queue (Inbox) for offline recipients |
-| **Redis down** | Pub/Sub + Streams: all routing broken | Redis Cluster with replicas; fallback to broadcast during outage |
+| **Redis down** | Pub/Sub + Streams: all routing broken | Redis Cluster with replicas (failover in seconds). Broadcast fallback only for small fleets / low message rates; at large scale skip real-time push for affected users and rely on a durable inbox path (see [Chat System](/problems/messaging/chat-system#65-component-failure-summary)) |
 | **Network partition** | Servers in different partitions can't communicate | Redis Streams durability — messages queue until partition heals |
 | **Consumer lag (Streams)** | Delivery delay increases | Monitor lag; scale consumers; trim old entries |
 

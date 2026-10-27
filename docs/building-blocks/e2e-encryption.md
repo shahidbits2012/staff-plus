@@ -197,17 +197,21 @@ In a group of N members, pairwise encryption means encrypting every message N-1 
 
 ### How Sender Keys Work
 
-Each group member generates a **Sender Key** specific to this group:
+Each group member generates a **Sender Key** (random 256-bit AES key + chain key for ratcheting) **on-device**. The server never sees it in plaintext — distribution uses the existing pairwise Signal session:
 
 ```
 User A joins group (100 members):
-  1. A generates Sender Key for this group
+  1. A generates Sender Key on-device for this group
   2. A distributes Sender Key to all 99 members
-     (encrypted pairwise using each member's existing Signal session)
+     (each copy encrypted via A's existing pairwise Signal session with that member)
   3. All members store A's Sender Key
 
 Every member does the same → each member stores 100 Sender Keys
 ```
+
+:::note Why the server can't learn the Sender Key
+The Sender Key is wrapped inside a pairwise-encrypted Signal session message before it hits the server. The server relays ciphertext it cannot decrypt — just like it relays message ciphertext. The only attack is the server substituting public keys during X3DH (MITM), which is why Signal/WhatsApp provide **Safety Number** verification — users compare identity keys out-of-band (QR scan) to detect key substitution.
+:::
 
 **Sending a message:**
 
