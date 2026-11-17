@@ -92,7 +92,7 @@ function MermaidRenderer({value}: {value: string}) {
   return <MermaidRenderResult renderResult={renderResult} />;
 }
 
-export default function Mermaid(props: {value: string}): JSX.Element {
+export default function Mermaid(props: {value: string}): React.ReactElement {
   return (
     <ErrorBoundary
       fallback={(params) => <ErrorBoundaryErrorMessageFallback {...params} />}>
