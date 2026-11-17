@@ -23,7 +23,7 @@ export default function DesignPreview({
   file,
   height = 600,
   title = 'Design Preview',
-}: Props): JSX.Element {
+}: Props): React.ReactElement {
   const {siteConfig} = useDocusaurusContext();
   const vetoraUrl = ((siteConfig.customFields?.vetoraUrl as string) || '').replace(
     /\/+$/,

@@ -1,6 +1,9 @@
 ---
 sidebar_position: 2
 title: "Collaborative Editing (e.g. Google Sheets)"
+sidebar_class_name: vt-draft
+status: draft
+summary: "Multi-user real-time collaborative editor with concurrent conflict resolution, cursor presence, and persistent edit history."
 ---
 
 # Collaborative Editing

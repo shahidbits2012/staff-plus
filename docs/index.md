@@ -17,7 +17,7 @@ Every page answers **why, how, trade-offs, and failure modes** — not just defi
 | Section | What's Inside |
 |---------|--------------|
 | **[Guide](/method/framework)** | Foundations, distributed systems, building blocks, patterns, and architectural decisions |
-| **[Problems](/problems/messaging/chat-system)** | System design problems with deep-dive trade-off analysis |
+| **[Problems](/problems)** | System design problems with deep-dive trade-off analysis |
 | **[Reference](/reference/patterns-cheatsheet)** | Quick-reference cheat sheets for patterns, decisions, and scaling |
 
 ---

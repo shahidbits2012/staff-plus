@@ -1,6 +1,10 @@
 ---
 sidebar_position: 2
 title: "Top-K Heavy Hitters (e.g. YouTube Top Videos)"
+difficulty: staff
+status: complete
+summary: "Precomputed top-K heavy hitters using Flink stream processing with exact hourly aggregates and approximate Count-Min Sketch for live rankings."
+concepts: [building-blocks/stream-processing, foundations/probabilistic-data-structures, building-blocks/kafka, building-blocks/redis, building-blocks/postgresql, distributed-systems/sharding, foundations/observability]
 ---
 
 # Top-K Heavy Hitters

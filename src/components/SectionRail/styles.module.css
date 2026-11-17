@@ -1,0 +1,62 @@
+.rail {
+  position: sticky;
+  top: calc(var(--ifm-navbar-height, 60px) + 3px); /* 3px for reading-progress bar */
+  z-index: 99; /* below navbar (100) */
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  height: 44px;
+  padding: 0 1rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--vt-border-subtle);
+  background: color-mix(in srgb, var(--vt-bg) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+}
+
+.rail::-webkit-scrollbar {
+  display: none;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  padding: 4px 10px;
+  border-radius: 999px;
+  color: var(--vt-text-secondary);
+  text-decoration: none;
+  flex-shrink: 0;
+  transition: background 150ms ease, color 150ms ease;
+}
+
+.chip:hover {
+  background: var(--vt-surface-hover);
+  color: var(--vt-text);
+  text-decoration: none;
+}
+
+.chip[aria-current='true'] {
+  color: var(--vt-blue);
+  background: color-mix(in srgb, var(--vt-blue) 12%, transparent);
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+/* Hide in cheat-sheet mode */
+html[data-vt-view='cheatsheet'] .rail {
+  display: none;
+}
+
+@media print {
+  .rail {
+    display: none;
+  }
+}

@@ -1,6 +1,10 @@
 ---
 sidebar_position: 2
 title: Live Comments (e.g. FB / Instagram Live)
+difficulty: staff
+status: complete
+summary: "Real-time ephemeral comment overlay for live streams using Redis Streams for storage and Pub/Sub for fan-out to 1M+ concurrent viewers."
+concepts: [building-blocks/websocket-connection-management, building-blocks/redis, building-blocks/kafka, patterns/fan-out, patterns/rate-limiting, distributed-systems/sharding, distributed-systems/consistent-hashing, foundations/observability]
 ---
 
 # Live Comments

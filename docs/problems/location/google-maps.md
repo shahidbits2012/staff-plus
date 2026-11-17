@@ -1,6 +1,9 @@
 ---
 sidebar_position: 2
 title: "Google Maps (Navigation & ETA)"
+sidebar_class_name: vt-draft
+status: draft
+summary: "Map tile rendering, driving directions with shortest-path routing, and real-time ETA updates with live traffic data."
 ---
 
 # Google Maps

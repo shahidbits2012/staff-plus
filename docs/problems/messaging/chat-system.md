@@ -1,6 +1,10 @@
 ---
 sidebar_position: 1
 title: Chat System (e.g. WhatsApp / Slack)
+difficulty: staff
+status: complete
+summary: "E2E-encrypted real-time messaging with per-device delivery, write-time fan-out via Kafka, Redis inbox queues, and Cassandra storage."
+concepts: [building-blocks/api-gateway, building-blocks/websocket-connection-management, building-blocks/kafka, building-blocks/cassandra, building-blocks/redis, building-blocks/e2e-encryption, building-blocks/push-notifications, patterns/fan-out, patterns/presence-heartbeat, foundations/consistency]
 ---
 
 import CheatSheet from '@site/src/cheatsheets/chat-system';

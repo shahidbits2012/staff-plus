@@ -1,0 +1,71 @@
+.meta {
+  margin-bottom: 1.5rem;
+}
+
+.eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--vt-text-muted);
+  margin-bottom: 0.5rem;
+}
+
+.dot {
+  color: var(--vt-border);
+}
+
+.draft {
+  font-size: 14px;
+  color: var(--vt-amber);
+  margin: 0.25rem 0 0.5rem;
+}
+
+.concepts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.25rem;
+}
+
+.conceptsLabel {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--vt-text-muted);
+  margin-right: 0.25rem;
+}
+
+.pill {
+  display: inline-block;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--vt-surface);
+  border: 1px solid var(--vt-border-subtle);
+  color: var(--vt-text-secondary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.pill:hover {
+  background: var(--vt-surface-hover);
+  color: var(--vt-text);
+  text-decoration: none;
+}
+
+.more {
+  font-size: 12px;
+  color: var(--vt-text-muted);
+}
+
+@media print {
+  .concepts {
+    display: none;
+  }
+}

@@ -38,7 +38,7 @@ function Hero() {
         <div className={styles.ctaRow}>
           <Link
             className={clsx(styles.btn, styles.btnPrimary)}
-            to="/problems/messaging/chat-system">
+            to="/problems">
             Explore System Design →
           </Link>
           <Link
@@ -110,8 +110,8 @@ const tracks = [
     tag: 'Available',
     title: 'System Design',
     body: 'Real problems — chat systems, feeds, rate limiters — each with requirements, HLD, deep dives per NFR, bottlenecks, and a trade-off summary.',
-    link: '/problems/messaging/chat-system',
-    cta: 'Start with the Chat System',
+    link: '/problems',
+    cta: 'Browse all problems',
   },
   {
     status: 'available',
@@ -199,7 +199,7 @@ function CommunityBand() {
           </Link>
           <Link
             className={clsx(styles.btn, styles.btnOutline)}
-            href={`${GITHUB_URL}/blob/main/CONTRIBUTING.md`}>
+            href={`${GITHUB_URL}/blob/${site.githubBranch}/CONTRIBUTING.md`}>
             Contribute a page
           </Link>
         </div>

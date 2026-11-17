@@ -1,0 +1,26 @@
+.wrap {
+  overflow-x: auto;
+  border: 1px solid var(--vt-border-subtle);
+  border-radius: 0.75rem;
+  margin: var(--ifm-spacing-vertical) 0;
+
+  /*
+   * Scroll shadows (CSS-only, no JS).
+   * Two "cover" gradients (background-attachment: local) move with the content
+   * and mask the shadows at the resting edges. Two "shadow" gradients
+   * (background-attachment: scroll) stay fixed and reveal when content is
+   * scrolled away from that edge.
+   */
+  --_shadow: color-mix(in srgb, var(--vt-text) 22%, transparent);
+  background:
+    linear-gradient(90deg, var(--vt-bg) 1rem, transparent 1rem) local,
+    linear-gradient(270deg, var(--vt-bg) 1rem, transparent 1rem) local,
+    linear-gradient(90deg, var(--_shadow), transparent 1rem) scroll,
+    linear-gradient(270deg, var(--_shadow), transparent 1rem) scroll;
+  background-color: var(--vt-bg);
+}
+
+.wrap:focus-visible {
+  outline: 2px solid var(--vt-blue);
+  outline-offset: 2px;
+}
