@@ -156,6 +156,25 @@ article {
   letter-spacing: -0.02em;
 }
 
+/* ── Sidebar draft badges ────────────────────────────────────────────────── */
+.menu__list-item.vt-draft > .menu__link {
+  color: var(--vt-text-muted);
+}
+
+.menu__list-item.vt-draft > .menu__link::after {
+  content: 'Soon' / '';
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--vt-amber) 14%, transparent);
+  color: var(--vt-amber);
+  flex-shrink: 0;
+}
+
 .theme-doc-sidebar-container {
   border-right-color: var(--vt-border-subtle) !important;
 }
@@ -239,8 +258,14 @@ article {
   background:
     radial-gradient(900px 380px at 85% -15%, color-mix(in srgb, var(--vt-blue) 18%, transparent), transparent 70%),
     radial-gradient(700px 320px at -5% 60%, color-mix(in srgb, var(--vt-purple) 10%, transparent), transparent 70%);
-  -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent);
-  mask-image: linear-gradient(to bottom, #000 55%, transparent);
+  -webkit-mask-image:
+    linear-gradient(to bottom, #000 55%, transparent),
+    linear-gradient(to right, transparent, #000 10%, #000 90%, transparent);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    linear-gradient(to bottom, #000 55%, transparent),
+    linear-gradient(to right, transparent, #000 10%, #000 90%, transparent);
+  mask-composite: intersect;
 }
 
 html[data-theme='light'] .vt-doc-glow {
@@ -346,16 +371,35 @@ html[data-theme='light'] .vt-doc-glow {
 }
 
 /* ── Tables (Vetora DataTable) ────────────────────────────────────────────── */
+/* Card border/radius live on .vt-table-wrap (src/components/TableWrap).
+   The table itself is borderless so it can scroll inside the wrapper. */
 .theme-doc-markdown table {
   display: table;
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
-  border: 1px solid var(--vt-border-subtle);
-  border-radius: 0.75rem;
-  overflow: hidden;
+  border: none;
+  border-radius: 0;
+  margin: 0;
   font-size: 14.5px;
   line-height: 1.6;
+}
+
+.theme-doc-markdown th,
+.theme-doc-markdown td {
+  min-width: 4.5rem;
+}
+
+/* Tables with ≥ 4 columns get wider cells on mobile so they scroll instead of crushing */
+@media (max-width: 996px) {
+  .theme-doc-markdown table:has(tr > :nth-child(4)) :is(th, td) {
+    min-width: 9rem;
+  }
+}
+
+.theme-doc-markdown td code,
+.theme-doc-markdown th code {
+  overflow-wrap: anywhere;
 }
 
 .theme-doc-markdown thead tr {
@@ -563,6 +607,29 @@ html[data-theme='light'] .vt-doc-glow {
   color: var(--vt-text-secondary) !important;
 }
 
+/* ── Diagram expand button ───────────────────────────────────────────────── */
+.docusaurus-mermaid-container:hover + button[aria-label="Expand diagram"],
+button[aria-label="Expand diagram"]:hover,
+button[aria-label="Expand diagram"]:focus-visible {
+  opacity: 1 !important;
+}
+
+@media (hover: none) {
+  button[aria-label="Expand diagram"] {
+    opacity: 1 !important;
+  }
+}
+
+/* Dialog: flex layout only when open (UA hides closed dialogs with display:none) */
+dialog.vt-mermaid-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
 /* ── Breadcrumbs & pagination ─────────────────────────────────────────────── */
 .breadcrumbs__link {
   font-size: 13px;
@@ -616,6 +683,13 @@ html[data-theme='light'] .vt-doc-glow {
 :focus-visible {
   outline: 2px solid var(--vt-blue);
   outline-offset: 2px;
+}
+
+/* ── Section rail scroll offset ──────────────────────────────────────────── */
+/* When the sticky section rail is mounted it sets data-vt-rail and
+   --vt-rail-height on :root. Push heading anchors below both bars. */
+html[data-vt-rail] .theme-doc-markdown :is(h2, h3, h4, h5, h6) {
+  scroll-margin-top: calc(var(--ifm-navbar-height) + var(--vt-rail-height) + 0.5rem);
 }
 
 /* ── Cheat-sheet mode (src/components/CheatSheetToggle) ───────────────────── */

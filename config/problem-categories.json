@@ -1,0 +1,7 @@
+[
+  {"dir":"messaging","label":"Messaging Systems","description":"Real-time delivery, ordering and offline sync between users and devices."},
+  {"dir":"real-time","label":"Real-Time Systems","description":"Systems where freshness is the product: counters, rankings and live fan-out."},
+  {"dir":"location","label":"Location & Geospatial","description":"Geospatial indexing, matching and routing at city scale."},
+  {"dir":"storage","label":"Storage & Data Infrastructure","description":"Durable, scalable storage for files and large objects."},
+  {"dir":"collaboration","label":"Collaboration Systems","description":"Concurrent editing and conflict resolution across many users."}
+]

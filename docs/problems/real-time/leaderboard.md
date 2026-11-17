@@ -1,6 +1,9 @@
 ---
 sidebar_position: 4
 title: "Leaderboard (e.g. Gaming / Spotify Charts)"
+sidebar_class_name: vt-draft
+status: draft
+summary: "Real-time leaderboard with full ranking, arbitrary rank lookup, pagination, and score updates for gaming or charts."
 ---
 
 # Leaderboard

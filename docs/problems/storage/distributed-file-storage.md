@@ -1,6 +1,9 @@
 ---
 sidebar_position: 2
 title: "Distributed File Storage (e.g. Amazon S3)"
+sidebar_class_name: vt-draft
+status: draft
+summary: "Exabyte-scale object storage with 11-nines durability, multi-part upload, and cross-AZ erasure coding."
 ---
 
 # Distributed File Storage

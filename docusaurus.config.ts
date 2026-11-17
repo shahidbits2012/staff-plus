@@ -83,6 +83,8 @@ const config: Config = {
     // Serves /sitemap.xml + /robots.txt on the dev server and writes robots.txt
     // at build time — hostname sourced from config/env.*.json.
     './plugins/seo-endpoints.js',
+    // Exposes problem metadata for the /problems catalog page.
+    './plugins/content-index.js',
   ],
 
   themeConfig: {
@@ -100,10 +102,10 @@ const config: Config = {
           label: 'Guide',
         },
         {
-          type: 'docSidebar',
-          sidebarId: 'problemsSidebar',
-          position: 'left',
+          to: '/problems',
           label: 'Problems',
+          position: 'left',
+          activeBasePath: 'problems',
         },
         {
           type: 'docSidebar',
@@ -130,7 +132,7 @@ const config: Config = {
           title: 'Learn',
           items: [
             {label: 'System Design Method', to: '/method/framework'},
-            {label: 'Problems', to: '/problems/messaging/chat-system'},
+            {label: 'Problems', to: '/problems'},
             {label: 'Reference', to: '/reference/patterns-cheatsheet'},
           ],
         },
@@ -146,7 +148,7 @@ const config: Config = {
           title: 'About',
           items: [
             {label: 'How this site works', to: '/intro'},
-            {label: '100% Free, Forever', to: '/intro'},
+            {label: 'Content philosophy', href: `${site.githubRepoUrl}/blob/${site.githubBranch}/CONTRIBUTING.md#content-philosophy`},
           ],
         },
       ],

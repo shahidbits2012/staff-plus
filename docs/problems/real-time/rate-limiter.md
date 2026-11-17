@@ -1,6 +1,10 @@
 ---
 sidebar_position: 1
 title: Distributed Rate Limiter
+difficulty: senior
+status: complete
+summary: "Distributed rate limiter in the API gateway with hybrid local+Redis counters, sliding window algorithms, multi-region sync, and fail-open resilience."
+concepts: [patterns/rate-limiting, building-blocks/redis, building-blocks/kafka, building-blocks/api-gateway, distributed-systems/sharding, distributed-systems/consistent-hashing, distributed-systems/partitioning, patterns/circuit-breaker, patterns/bulkhead, foundations/observability]
 ---
 
 import CheatSheet from '@site/src/cheatsheets/rate-limiter';

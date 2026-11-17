@@ -1,6 +1,9 @@
 ---
 sidebar_position: 3
 title: "Ride Hailing (e.g. Uber / Lyft)"
+sidebar_class_name: vt-draft
+status: draft
+summary: "Rider-driver matching with real-time location tracking, trip state management, fare computation, and surge pricing."
 ---
 
 # Ride Hailing
