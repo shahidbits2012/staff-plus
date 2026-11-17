@@ -109,3 +109,7 @@ Every problem page should evaluate NFRs using the **LSDARO** checklist. Not ever
 - If JSX is needed (e.g., iframe with style object), the style must use JSX syntax `style={{...}}` and any curly braces in prose/tables must be wrapped in backticks.
 - Mermaid diagrams work in `.md` files (enabled via `docusaurus.config.ts`).
 - Use `:::info`, `:::note`, `:::tip` for callout boxes.
+
+## Development Workflow
+
+- Use the `dev` branch (currently `feat/ui-ux-revamp`) for all development work. Do not develop on `main`.
