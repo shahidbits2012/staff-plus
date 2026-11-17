@@ -3,12 +3,13 @@
 # promote.sh — promote dev → main via a GitHub pull request.
 #
 # Usage:
-#   ./scripts/promote.sh <github_pat> [--merge]
+#   ./scripts/promote.sh [--merge]
 #
-# Arguments:
-#   github_pat   (required) GitHub Personal Access Token with `repo` scope.
-#   --merge      (optional) Auto-merge the PR after creation. Without this
-#                flag the script creates the PR and prints its URL.
+# The script prompts for your GitHub PAT interactively (input is hidden).
+#
+# Options:
+#   --merge      Auto-merge the PR after creation. Without this flag the
+#                script creates the PR and prints its URL.
 #
 # Workflow:
 #   1. Ensures local dev is pushed to origin/dev.
@@ -23,14 +24,17 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
-PAT="${1:-}"
 AUTO_MERGE=false
 for arg in "$@"; do
   [[ "$arg" == "--merge" ]] && AUTO_MERGE=true
 done
 
+echo -n "GitHub PAT (input hidden): "
+read -rs PAT
+echo
+
 if [[ -z "$PAT" ]]; then
-  echo "Usage: ./scripts/promote.sh <github_pat> [--merge]"
+  echo "PAT cannot be empty."
   exit 1
 fi
 
