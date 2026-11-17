@@ -54,9 +54,9 @@ fi
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
-OWNER="$(node -p "require('./$CONFIG_FILE').githubOwner")"
-REPO="$(node -p "require('./$CONFIG_FILE').githubRepoName")"
-TARGET="$(node -p "require('./$CONFIG_FILE').githubBranch || 'main'")"
+OWNER="$(node --no-experimental-strip-types -p "require('./$CONFIG_FILE').githubOwner")"
+REPO="$(node --no-experimental-strip-types -p "require('./$CONFIG_FILE').githubRepoName")"
+TARGET="$(node --no-experimental-strip-types -p "require('./$CONFIG_FILE').githubBranch || 'main'")"
 SOURCE="dev"
 API="https://api.github.com/repos/${OWNER}/${REPO}"
 
@@ -110,31 +110,35 @@ echo "Commits to promote: ${AHEAD}"
 # ---------------------------------------------------------------------------
 # 3. Create PR (or find existing)
 # ---------------------------------------------------------------------------
+parse_json() {
+  node --no-experimental-strip-types -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'))${1}"
+}
+
 EXISTING=$(gh_api GET "/pulls?head=${OWNER}:${SOURCE}&base=${TARGET}&state=open" | \
-  node -p 'JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"))[0]?.number || ""')
+  parse_json '[0]?.number || ""')
 
 if [[ -n "$EXISTING" ]]; then
   PR_NUM="$EXISTING"
   echo "Found existing PR #${PR_NUM}"
 else
-  # Build title from commit subjects
   TITLE="Promote ${SOURCE} to ${TARGET}"
-  BODY=$(git log --format='- %s' "origin/${TARGET}..origin/${SOURCE}")
+  BODY="## Changes"$'\n'"$(git log --format='- %s' "origin/${TARGET}..origin/${SOURCE}")"
 
-  RESPONSE=$(gh_api POST "/pulls" "$(node -e "
-    console.log(JSON.stringify({
-      title: '${TITLE}',
-      head: '${SOURCE}',
-      base: '${TARGET}',
-      body: $(node -p "JSON.stringify(\`## Changes\n${BODY}\`)")
-    }))
-  ")")
+  PR_JSON=$(node --no-experimental-strip-types -e "
+    var o = {};
+    o.title = process.argv[1];
+    o.head  = process.argv[2];
+    o.base  = process.argv[3];
+    o.body  = process.argv[4];
+    console.log(JSON.stringify(o));
+  " "$TITLE" "$SOURCE" "$TARGET" "$BODY")
 
-  PR_NUM=$(echo "$RESPONSE" | node -p 'JSON.parse(require("fs").readFileSync("/dev/stdin","utf8")).number || ""')
+  RESPONSE=$(gh_api POST "/pulls" "$PR_JSON")
+  PR_NUM=$(echo "$RESPONSE" | parse_json '.number || ""')
 
   if [[ -z "$PR_NUM" ]]; then
     echo "Failed to create PR:"
-    echo "$RESPONSE" | node -p 'JSON.parse(require("fs").readFileSync("/dev/stdin","utf8")).message || "unknown error"'
+    echo "$RESPONSE" | parse_json '.message || "unknown error"'
     exit 1
   fi
   echo "Created PR #${PR_NUM}"
@@ -152,7 +156,7 @@ if [[ "$AUTO_MERGE" == true ]]; then
   # Wait for mergeable status (GitHub needs a moment after PR creation)
   for i in $(seq 1 10); do
     MERGEABLE=$(gh_api GET "/pulls/${PR_NUM}" | \
-      node -p 'JSON.parse(require("fs").readFileSync("/dev/stdin","utf8")).mergeable ?? "null"')
+      parse_json '.mergeable ?? "null"')
     [[ "$MERGEABLE" != "null" ]] && break
     sleep 2
   done
@@ -164,7 +168,7 @@ if [[ "$AUTO_MERGE" == true ]]; then
   fi
 
   MERGE_RESULT=$(gh_api PUT "/pulls/${PR_NUM}/merge" "{\"merge_method\":\"squash\"}")
-  MERGED=$(echo "$MERGE_RESULT" | node -p 'JSON.parse(require("fs").readFileSync("/dev/stdin","utf8")).merged || false')
+  MERGED=$(echo "$MERGE_RESULT" | parse_json '.merged || false')
 
   if [[ "$MERGED" == "true" ]]; then
     echo "Merged PR #${PR_NUM} into ${TARGET}"
@@ -175,7 +179,7 @@ if [[ "$AUTO_MERGE" == true ]]; then
     git checkout -q "${SOURCE}"
     echo "Local ${TARGET} updated."
   else
-    MSG=$(echo "$MERGE_RESULT" | node -p 'JSON.parse(require("fs").readFileSync("/dev/stdin","utf8")).message || "unknown error"')
+    MSG=$(echo "$MERGE_RESULT" | parse_json '.message || "unknown error"')
     echo "Merge failed: ${MSG}"
     echo "  Merge manually: ${PR_URL}"
     exit 1
