@@ -20,6 +20,12 @@ import {
   MermaidContainerClassName,
   useMermaidConfig,
 } from '@docusaurus/theme-mermaid/client';
+// Side-effect import: adds `.transition()` to d3 selections. Mermaid's
+// flowchart tooltip handler calls it on every node mouseout, but webpack
+// drops d3-transition because `d3` is marked side-effect-free and Mermaid
+// only imports `select` from it. Without this, hovering a node throws
+// "tooltipElem.transition is not a function".
+import 'd3-transition';
 
 // Serializes all mermaid.render() calls across the page.
 let renderQueue: Promise<unknown> = Promise.resolve();
