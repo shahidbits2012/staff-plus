@@ -112,4 +112,4 @@ Every problem page should evaluate NFRs using the **LSDARO** checklist. Not ever
 
 ## Development Workflow
 
-- Use the `dev` branch (currently `feat/ui-ux-revamp`) for all development work. Do not develop on `main`.
+- Use the `dev` branch for all development work. Do not develop on `main`; merge `dev` → `main` via PR.

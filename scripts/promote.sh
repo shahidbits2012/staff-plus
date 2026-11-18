@@ -1,35 +1,45 @@
 #!/usr/bin/env bash
 #
-# promote.sh — publish the Staff Prep site to GitHub.
+# promote.sh — promote dev → main via a GitHub pull request.
 #
 # Usage:
-#   ./scripts/promote.sh <github_pat> [commit_message]
+#   ./scripts/promote.sh [--merge]
 #
-# Arguments:
-#   github_pat       (required) GitHub Personal Access Token with `repo` scope.
-#   commit_message   (optional) Commit message. Defaults to a timestamped message.
+# The script prompts for your GitHub PAT interactively (input is hidden).
 #
-# Repo details (owner / name / branch) are read from config/site.json — the
-# single source of truth for app configuration. Update that file, not this script.
+# Options:
+#   --merge      Auto-merge the PR after creation. Without this flag the
+#                script creates the PR and prints its URL.
 #
-# The token is never written to the stored git remote and is masked in output.
+# Workflow:
+#   1. Ensures local dev is pushed to origin/dev.
+#   2. Creates a PR from dev → main (or finds an existing open one).
+#   3. With --merge: waits for checks, then merges (squash).
+#
+# Repo details are read from config/site.json.
+# The token is never written to the stored git remote.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
-PAT="${1:-}"
-COMMIT_MSG="${2:-chore: publish site updates ($(date +%Y-%m-%d\ %H:%M:%S))}"
+AUTO_MERGE=false
+for arg in "$@"; do
+  [[ "$arg" == "--merge" ]] && AUTO_MERGE=true
+done
+
+echo -n "GitHub PAT (input hidden): "
+read -rs PAT
+echo
 
 if [[ -z "$PAT" ]]; then
-  echo "❌ GitHub PAT is required."
-  echo "   Usage: ./scripts/promote.sh <github_pat> [commit_message]"
+  echo "PAT cannot be empty."
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# Resolve project root (script lives in <root>/scripts)
+# Resolve project root
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -37,78 +47,144 @@ cd "$ROOT_DIR"
 
 CONFIG_FILE="config/site.json"
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "❌ Missing $CONFIG_FILE"
+  echo "Missing $CONFIG_FILE"
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
-OWNER="$(node -p "require('./$CONFIG_FILE').githubOwner")"
-REPO="$(node -p "require('./$CONFIG_FILE').githubRepoName")"
-BRANCH="$(node -p "require('./$CONFIG_FILE').githubBranch || 'main'")"
+OWNER="$(node --no-experimental-strip-types -p "require('./$CONFIG_FILE').githubOwner")"
+REPO="$(node --no-experimental-strip-types -p "require('./$CONFIG_FILE').githubRepoName")"
+TARGET="$(node --no-experimental-strip-types -p "require('./$CONFIG_FILE').githubBranch || 'main'")"
+SOURCE="dev"
+API="https://api.github.com/repos/${OWNER}/${REPO}"
 
 if [[ -z "$OWNER" || -z "$REPO" ]]; then
-  echo "❌ githubOwner / githubRepoName missing in $CONFIG_FILE"
+  echo "githubOwner / githubRepoName missing in $CONFIG_FILE"
   exit 1
 fi
 
-CLEAN_URL="https://github.com/${OWNER}/${REPO}.git"
-PUSH_URL="https://${OWNER}:${PAT}@github.com/${OWNER}/${REPO}.git"
+gh_api() {
+  local method="$1" endpoint="$2" body="${3:-}"
+  local args=(-s -H "Authorization: token ${PAT}" -H "Accept: application/vnd.github+json")
+  if [[ -n "$body" ]]; then
+    args+=(-X "$method" -d "$body")
+  elif [[ "$method" != "GET" ]]; then
+    args+=(-X "$method")
+  fi
+  curl "${args[@]}" "${API}${endpoint}"
+}
 
-echo "📦 Repo:   ${OWNER}/${REPO}"
-echo "🌿 Branch: ${BRANCH}"
+echo "Repo:   ${OWNER}/${REPO}"
+echo "PR:     ${SOURCE} -> ${TARGET}"
 
 # ---------------------------------------------------------------------------
-# Ensure git repo + identity + remote
+# 1. Ensure dev is pushed
 # ---------------------------------------------------------------------------
-if [[ ! -d .git ]]; then
-  git init -q
-  echo "✅ Initialized git repository"
+CURRENT_BRANCH="$(git branch --show-current)"
+if [[ "$CURRENT_BRANCH" != "$SOURCE" ]]; then
+  echo "Not on ${SOURCE} branch (on ${CURRENT_BRANCH}). Switch first."
+  exit 1
 fi
 
-git config user.name  >/dev/null 2>&1 || git config user.name  "Staff Prep"
-git config user.email >/dev/null 2>&1 || git config user.email "staff-prep@users.noreply.github.com"
+git fetch -q origin
+LOCAL="$(git rev-parse ${SOURCE})"
+REMOTE="$(git rev-parse "origin/${SOURCE}" 2>/dev/null || echo "")"
 
-if git remote get-url origin >/dev/null 2>&1; then
-  git remote set-url origin "$CLEAN_URL"
+if [[ "$LOCAL" != "$REMOTE" ]]; then
+  echo "Pushing ${SOURCE} to origin..."
+  git push -q origin "${SOURCE}"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Check for commits ahead of target
+# ---------------------------------------------------------------------------
+AHEAD="$(git rev-list --count "origin/${TARGET}..origin/${SOURCE}")"
+if [[ "$AHEAD" == "0" ]]; then
+  echo "${SOURCE} is up to date with ${TARGET}. Nothing to promote."
+  exit 0
+fi
+echo "Commits to promote: ${AHEAD}"
+
+# ---------------------------------------------------------------------------
+# 3. Create PR (or find existing)
+# ---------------------------------------------------------------------------
+parse_json() {
+  node --no-experimental-strip-types -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'))${1}"
+}
+
+EXISTING=$(gh_api GET "/pulls?head=${OWNER}:${SOURCE}&base=${TARGET}&state=open" | \
+  parse_json '[0]?.number || ""')
+
+if [[ -n "$EXISTING" ]]; then
+  PR_NUM="$EXISTING"
+  echo "Found existing PR #${PR_NUM}"
 else
-  git remote add origin "$CLEAN_URL"
-fi
+  TITLE="Promote ${SOURCE} to ${TARGET}"
+  BODY="## Changes"$'\n'"$(git log --format='- %s' "origin/${TARGET}..origin/${SOURCE}")"
 
-# ---------------------------------------------------------------------------
-# Stage & commit
-# ---------------------------------------------------------------------------
-git add -A
-if git diff --cached --quiet; then
-  echo "ℹ️  No staged changes — committing nothing."
-else
-  git commit -q -m "$COMMIT_MSG"
-  echo "✅ Committed: $COMMIT_MSG"
-fi
+  PR_JSON=$(node --no-experimental-strip-types -e "
+    var o = {};
+    o.title = process.argv[1];
+    o.head  = process.argv[2];
+    o.base  = process.argv[3];
+    o.body  = process.argv[4];
+    console.log(JSON.stringify(o));
+  " "$TITLE" "$SOURCE" "$TARGET" "$BODY")
 
-git branch -M "$BRANCH"
+  RESPONSE=$(gh_api POST "/pulls" "$PR_JSON")
+  PR_NUM=$(echo "$RESPONSE" | parse_json '.number || ""')
 
-# ---------------------------------------------------------------------------
-# Integrate any existing remote history (e.g. a GitHub-created README),
-# then push. Token is kept out of the stored remote and masked in logs.
-# ---------------------------------------------------------------------------
-echo "🔄 Checking remote history..."
-if git fetch -q "$PUSH_URL" "$BRANCH" 2>/dev/null; then
-  if ! git rebase -q FETCH_HEAD; then
-    echo "❌ Rebase onto remote ${BRANCH} hit conflicts."
-    echo "   Resolve them, run 'git rebase --continue', then re-run promote.sh."
+  if [[ -z "$PR_NUM" ]]; then
+    echo "Failed to create PR:"
+    echo "$RESPONSE" | parse_json '.message || "unknown error"'
     exit 1
   fi
-  echo "✅ Rebased local commits onto remote ${BRANCH}"
-else
-  echo "ℹ️  No existing remote branch — will create ${BRANCH}."
+  echo "Created PR #${PR_NUM}"
 fi
 
-echo "🚀 Pushing to ${OWNER}/${REPO} (${BRANCH})..."
-if git push "$PUSH_URL" "HEAD:${BRANCH}" 2>&1 | sed "s/${PAT}/***/g"; then
-  echo "✅ Published → ${CLEAN_URL}"
+PR_URL="https://github.com/${OWNER}/${REPO}/pull/${PR_NUM}"
+echo "URL: ${PR_URL}"
+
+# ---------------------------------------------------------------------------
+# 4. Merge (if --merge)
+# ---------------------------------------------------------------------------
+if [[ "$AUTO_MERGE" == true ]]; then
+  echo "Merging PR #${PR_NUM} (squash)..."
+
+  # Wait for mergeable status (GitHub needs a moment after PR creation)
+  for i in $(seq 1 10); do
+    MERGEABLE=$(gh_api GET "/pulls/${PR_NUM}" | \
+      parse_json '.mergeable ?? "null"')
+    [[ "$MERGEABLE" != "null" ]] && break
+    sleep 2
+  done
+
+  if [[ "$MERGEABLE" == "false" ]]; then
+    echo "PR is not mergeable (conflicts or checks failing). Merge manually:"
+    echo "  ${PR_URL}"
+    exit 1
+  fi
+
+  MERGE_RESULT=$(gh_api PUT "/pulls/${PR_NUM}/merge" "{\"merge_method\":\"squash\"}")
+  MERGED=$(echo "$MERGE_RESULT" | parse_json '.merged || false')
+
+  if [[ "$MERGED" == "true" ]]; then
+    echo "Merged PR #${PR_NUM} into ${TARGET}"
+    # Update local main
+    git fetch -q origin
+    git checkout -q "${TARGET}"
+    git pull -q origin "${TARGET}"
+    git checkout -q "${SOURCE}"
+    echo "Local ${TARGET} updated."
+  else
+    MSG=$(echo "$MERGE_RESULT" | parse_json '.message || "unknown error"')
+    echo "Merge failed: ${MSG}"
+    echo "  Merge manually: ${PR_URL}"
+    exit 1
+  fi
 else
-  echo "❌ Push failed."
-  exit 1
+  echo "Review and merge: ${PR_URL}"
+  echo "Or re-run with --merge to auto-merge."
 fi
